@@ -1,0 +1,343 @@
+#include "nevanlinna_pick.hpp"
+#include <Eigen/SVD>
+#include <cmath>
+#include <algorithm>
+#include <numeric>
+#include <iostream>
+
+namespace np {
+
+NevanlinnaPick::NevanlinnaPick(
+    const std::vector<Complex>& loads,
+    const std::vector<double>& freqs,
+    const std::vector<Complex>& transmission_zeros,
+    double return_loss
+)
+    : order_(static_cast<int>(loads.size()))
+{
+    // Compute frequency shift (mean)
+    shift_ = std::accumulate(freqs.begin(), freqs.end(), 0.0) / freqs.size();
+
+    // Normalize frequencies
+    freqs_.resize(freqs.size());
+    for (size_t i = 0; i < freqs.size(); ++i) {
+        freqs_[i] = freqs[i] - shift_;
+    }
+
+    // Shift transmission zeros
+    std::vector<Complex> shifted_tzs;
+    for (const auto& tz : transmission_zeros) {
+        shifted_tzs.push_back(tz - shift_);
+    }
+
+    // Store target loads
+    target_loads_ = Eigen::Map<const VectorXcd>(loads.data(), loads.size());
+
+    // Create Chebyshev filter to get initial polynomials
+    ChebyshevFilter filter(order_, shifted_tzs, return_loss);
+
+    // Get polynomial coefficients (stored in descending order for this class)
+    initial_p_ = get_coeffs(filter.F());
+    r_coeffs_ = get_coeffs(filter.P());
+
+    // Compute initial S-parameters
+    init_sparams_ = eval_map(initial_p_);
+}
+
+VectorXcd NevanlinnaPick::eval_map(const VectorXcd& p_coeffs) const {
+    auto r_poly = build_polynomial(r_coeffs_);
+    auto p_poly = build_polynomial(p_coeffs);
+
+    // Compute spectral factor q such that |q|² = |p|² + |r|²
+    auto q_poly = SpectralFactor::feldtkeller(p_poly, r_poly);
+
+    // Evaluate p/q at each interpolation frequency
+    VectorXcd result(freqs_.size());
+    for (size_t k = 0; k < freqs_.size(); ++k) {
+        Complex s = Complex(0, freqs_[k]);
+        Complex p_val = p_poly.evaluate(s);
+        Complex q_val = q_poly.evaluate(s);
+        result(k) = p_val / q_val;
+    }
+
+    return result;
+}
+
+MatrixXcd NevanlinnaPick::eval_grad(const VectorXcd& p_coeffs) const {
+    auto r_poly = build_polynomial(r_coeffs_);
+    auto p_poly = build_polynomial(p_coeffs);
+    auto q_poly = SpectralFactor::feldtkeller(p_poly, r_poly);
+
+    int N = static_cast<int>(p_coeffs.size());
+    int M = static_cast<int>(freqs_.size());
+
+    // Evaluation points
+    std::vector<Complex> s(M);
+    for (int k = 0; k < M; ++k) {
+        s[k] = Complex(0, freqs_[k]);
+    }
+
+    // Precompute polynomial values
+    std::vector<Complex> p_vals(M), q_vals(M);
+    for (int k = 0; k < M; ++k) {
+        p_vals[k] = p_poly.evaluate(s[k]);
+        q_vals[k] = q_poly.evaluate(s[k]);
+    }
+
+    auto p_para = p_poly.para_conjugate();
+
+    MatrixXcd result(M, N);
+
+    // For each coefficient j, compute gradient
+    for (int j = 0; j < N; ++j) {
+        // dp = s^{N-1-j} (perturbation of coefficient j)
+        int deg = N - 1 - j;
+        std::vector<Complex> dp_coeffs(deg + 1, Complex(0));
+        dp_coeffs[deg] = Complex(1);
+        Polynomial<Complex> dp(dp_coeffs);
+        auto dp_para = dp.para_conjugate();
+
+        // RHS of Bezout equation: dq·q* + q·dq* = dp·p* + p·dp*
+        auto rhs = dp * p_para + p_poly * dp_para;
+
+        // Solve Bezout equation
+        auto dq = solve_bezout(q_poly, rhs, N);
+
+        // Compute gradient at each interpolation point
+        for (int k = 0; k < M; ++k) {
+            // ∂p/∂p_j evaluated at s[k] is s[k]^{N-1-j}
+            Complex dp_val = std::pow(s[k], deg);
+            Complex dq_val = dq.evaluate(s[k]);
+
+            // Quotient rule: ∂(p/q)/∂p_j = (∂p·q - p·∂q) / q²
+            result(k, j) = (dp_val * q_vals[k] - p_vals[k] * dq_val) / (q_vals[k] * q_vals[k]);
+        }
+    }
+
+    return result;
+}
+
+Polynomial<Complex> NevanlinnaPick::solve_bezout(
+    const Polynomial<Complex>& q,
+    const Polynomial<Complex>& rhs,
+    int max_degree
+) {
+    auto q_para = q.para_conjugate();
+    int n = max_degree;
+
+    // Check if q has essentially real coefficients
+    double max_imag_q = 0, max_real_q = 0;
+    for (const auto& c : q.coefficients) {
+        max_imag_q = std::max(max_imag_q, std::abs(c.imag()));
+        max_real_q = std::max(max_real_q, std::abs(c.real()));
+    }
+    bool q_is_real = max_imag_q < 1e-10 * std::max(1.0, max_real_q);
+
+    if (q_is_real) {
+        return solve_bezout_real(q, q_para, rhs, n);
+    }
+
+    // General complex case
+    int q_deg = q.degree();
+    int lhs_max_deg = q_deg + (n - 1);
+    int rhs_deg = rhs.degree();
+    int num_eqs = std::max(lhs_max_deg, rhs_deg) + 1;
+
+    // Build system: A x = b where x = [Re(c_0), Im(c_0), Re(c_1), Im(c_1), ...]
+    Eigen::MatrixXd A = Eigen::MatrixXd::Zero(2 * num_eqs, 2 * n);
+    Eigen::VectorXd b = Eigen::VectorXd::Zero(2 * num_eqs);
+
+    // Fill RHS
+    for (int k = 0; k < num_eqs; ++k) {
+        Complex rhs_coeff = (k <= rhs_deg) ? rhs.coefficients[k] : Complex(0);
+        b(2 * k) = rhs_coeff.real();
+        b(2 * k + 1) = rhs_coeff.imag();
+    }
+
+    // Fill matrix
+    for (int k = 0; k < num_eqs; ++k) {
+        for (int i = 0; i < n; ++i) {
+            int j = k - i;
+            if (j < 0 || j > q_deg) continue;
+
+            Complex q_para_j = q_para.coefficients[j];
+            Complex q_j = q.coefficients[j];
+            double sign = std::pow(-1.0, i);
+
+            // Coefficient contributions (see C# implementation for derivation)
+            A(2 * k, 2 * i) += q_para_j.real() + sign * q_j.real();
+            A(2 * k, 2 * i + 1) += -q_para_j.imag() + sign * q_j.imag();
+            A(2 * k + 1, 2 * i) += q_para_j.imag() + sign * q_j.imag();
+            A(2 * k + 1, 2 * i + 1) += q_para_j.real() - sign * q_j.real();
+        }
+    }
+
+    // Solve least squares using SVD
+    Eigen::JacobiSVD<Eigen::MatrixXd> svd(A, Eigen::ComputeThinU | Eigen::ComputeThinV);
+    Eigen::VectorXd solution = svd.solve(b);
+
+    // Extract coefficients
+    std::vector<Complex> dq_coeffs(n);
+    for (int i = 0; i < n; ++i) {
+        dq_coeffs[i] = Complex(solution(2 * i), solution(2 * i + 1));
+    }
+
+    // Null-space projection to preserve monic normalization
+    // The Bezout equation has null space: dq_null = i·β·q
+    // Project out to make leading coefficient have zero imaginary part
+    if (n > 0 && n <= static_cast<int>(q.coefficients.size())) {
+        double beta = dq_coeffs[n - 1].imag() / q.coefficients[n - 1].real();
+        for (int i = 0; i < n && i < static_cast<int>(q.coefficients.size()); ++i) {
+            dq_coeffs[i] -= Complex(0, 1) * beta * q.coefficients[i];
+        }
+    }
+
+    return Polynomial<Complex>(dq_coeffs);
+}
+
+Polynomial<Complex> NevanlinnaPick::solve_bezout_real(
+    const Polynomial<Complex>& q,
+    const Polynomial<Complex>& q_para,
+    const Polynomial<Complex>& rhs,
+    int n
+) {
+    int q_deg = q.degree();
+    int lhs_max_deg = q_deg + (n - 1);
+    int rhs_deg = rhs.degree();
+    int num_eqs = std::max(lhs_max_deg, rhs_deg) + 1;
+
+    // For real q, constrain dq to be real
+    Eigen::MatrixXd A = Eigen::MatrixXd::Zero(2 * num_eqs, n);
+    Eigen::VectorXd b = Eigen::VectorXd::Zero(2 * num_eqs);
+
+    // Fill RHS
+    for (int k = 0; k < num_eqs; ++k) {
+        Complex rhs_coeff = (k <= rhs_deg) ? rhs.coefficients[k] : Complex(0);
+        b(2 * k) = rhs_coeff.real();
+        b(2 * k + 1) = rhs_coeff.imag();
+    }
+
+    // Build matrix (simplified for real dq)
+    for (int k = 0; k < num_eqs; ++k) {
+        for (int i = 0; i < n; ++i) {
+            int j = k - i;
+            if (j < 0 || j > q_deg) continue;
+
+            Complex q_para_coeff = q_para.coefficients[j];
+            Complex q_coeff = q.coefficients[j];
+            double sign_i = std::pow(-1.0, i);
+
+            // For real d_i: total coefficient is (q_para[j] + q[j] * (-1)^i)
+            Complex coeff = q_para_coeff + q_coeff * sign_i;
+
+            A(2 * k, i) += coeff.real();
+            A(2 * k + 1, i) += coeff.imag();
+        }
+    }
+
+    // Solve least squares
+    Eigen::JacobiSVD<Eigen::MatrixXd> svd(A, Eigen::ComputeThinU | Eigen::ComputeThinV);
+    Eigen::VectorXd solution = svd.solve(b);
+
+    // Build dq polynomial with real coefficients
+    std::vector<Complex> dq_coeffs(n);
+    for (int i = 0; i < n; ++i) {
+        dq_coeffs[i] = Complex(solution(i), 0);
+    }
+
+    return Polynomial<Complex>(dq_coeffs);
+}
+
+VectorXcd NevanlinnaPick::calc_homotopy_function(const VectorXcd& x, double t) {
+    // H(x, t) = γ(t) - ψ(x)
+    // where γ(t) = t·init_sparams + (1-t)·target_loads*
+    VectorXcd gamma = t * init_sparams_ + (1.0 - t) * target_loads_.conjugate();
+    return gamma - eval_map(x);
+}
+
+VectorXcd NevanlinnaPick::calc_path_derivative(const VectorXcd& x, double t) {
+    // ∂H/∂t = ∂γ/∂t = init_sparams - target_loads*
+    return init_sparams_ - target_loads_.conjugate();
+}
+
+MatrixXcd NevanlinnaPick::calc_jacobian(const VectorXcd& x, double t) {
+    // J = ∂H/∂x = -∂ψ/∂x
+    return -eval_grad(x);
+}
+
+VectorXcd NevanlinnaPick::get_start_solution() {
+    return initial_p_;
+}
+
+int NevanlinnaPick::get_num_variables() {
+    return static_cast<int>(initial_p_.size());
+}
+
+Polynomial<Complex> NevanlinnaPick::build_polynomial(const VectorXcd& coeffs) {
+    // Coefficients in vector: [p_{n-1}, p_{n-2}, ..., p_0] (descending)
+    // Polynomial storage: [p_0, p_1, ..., p_{n-1}] (ascending)
+    std::vector<Complex> poly_coeffs(coeffs.size());
+    for (int i = 0; i < coeffs.size(); ++i) {
+        poly_coeffs[i] = coeffs(coeffs.size() - 1 - i);
+    }
+    return Polynomial<Complex>(poly_coeffs);
+}
+
+VectorXcd NevanlinnaPick::get_coeffs(const Polynomial<Complex>& p) {
+    // Convert from ascending to descending order
+    VectorXcd result(p.coefficients.size());
+    for (size_t i = 0; i < p.coefficients.size(); ++i) {
+        result(i) = p.coefficients[p.coefficients.size() - 1 - i];
+    }
+    return result;
+}
+
+// =====================================================================
+// NevanlinnaPickNormalized implementation
+// =====================================================================
+
+VectorXcd NevanlinnaPickNormalized::to_monic(const VectorXcd& x) {
+    // Input: [p_{n-2}, ..., p_0] (n-1 coefficients)
+    // Output: [1, p_{n-2}, ..., p_0] (n coefficients)
+    VectorXcd result(x.size() + 1);
+    result(0) = Complex(1, 0);
+    result.tail(x.size()) = x;
+    return result;
+}
+
+VectorXcd NevanlinnaPickNormalized::eval_map(const VectorXcd& x) const {
+    return NevanlinnaPick::eval_map(to_monic(x));
+}
+
+MatrixXcd NevanlinnaPickNormalized::eval_grad(const VectorXcd& x) const {
+    MatrixXcd full_grad = NevanlinnaPick::eval_grad(to_monic(x));
+    // Remove first column (derivative w.r.t. leading coefficient = 1)
+    return full_grad.rightCols(full_grad.cols() - 1);
+}
+
+VectorXcd NevanlinnaPickNormalized::get_start_solution() {
+    // Return coefficients without the leading 1
+    return initial_p_.tail(initial_p_.size() - 1);
+}
+
+int NevanlinnaPickNormalized::get_num_variables() {
+    return static_cast<int>(initial_p_.size()) - 1;
+}
+
+MatrixXcd NevanlinnaPickNormalized::calc_coupling_matrix(const VectorXcd& x) const {
+    auto m = to_monic(x);
+    auto r_poly = build_polynomial(r_coeffs_);
+    auto p_poly = build_polynomial(m);
+
+    // Shift polynomials back to original frequency domain
+    auto r_shifted = r_poly.shift(-shift_);
+    auto p_shifted = p_poly.shift(-shift_);
+
+    // Compute spectral factor
+    auto e_poly = SpectralFactor::feldtkeller(p_shifted, r_shifted);
+
+    // Build coupling matrix
+    return CouplingMatrix::from_polynomials(p_shifted, r_shifted, e_poly);
+}
+
+} // namespace np

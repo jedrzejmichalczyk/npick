@@ -1,0 +1,28 @@
+# Build directory
+build/
+
+# IDE files
+.idea/
+*.swp
+*.swo
+*~
+
+# External dependencies (downloaded, not part of repo)
+external/eigen/
+external/eigen.zip
+
+# Generated files
+*.o
+*.a
+*.so
+*.exe
+compile_commands.json
+
+# Test outputs
+*.csv
+*.png
+*.gp
+
+# OS files
+.DS_Store
+Thumbs.db
