@@ -44,12 +44,43 @@ public:
     /**
      * Build transversal coupling matrix from F, P, E polynomials.
      *
+     * Uses Y-parameter approach which works for para-Hermitian polynomials
+     * (standard lowpass prototypes like Chebyshev).
+     *
+     * For non-para-Hermitian polynomials (NP-modified), use
+     * from_polynomials_by_realization() instead.
+     *
      * @param F Reflection numerator polynomial
      * @param P Transmission numerator polynomial
      * @param E Common denominator (spectral factor)
      * @return (N+2) x (N+2) transversal coupling matrix
      */
     static MatrixXcd from_polynomials(
+        const Polynomial<Complex>& F,
+        const Polynomial<Complex>& P,
+        const Polynomial<Complex>& E
+    );
+
+    /**
+     * Build coupling matrix using state-space realization approach.
+     *
+     * This method works for general complex polynomials including
+     * NP-modified polynomials that break para-Hermitian symmetry.
+     *
+     * The approach (from C# FoldedByS):
+     * 1. Build S-parameter realization with A = diag(poles)
+     * 2. Apply Cayley transform to get Y-parameter realization
+     * 3. Compute minimal realization
+     * 4. Diagonalize
+     * 5. Symmetrize
+     * 6. Extract coupling matrix from transformed realization
+     *
+     * @param F Reflection numerator polynomial
+     * @param P Transmission numerator polynomial
+     * @param E Common denominator (spectral factor)
+     * @return (N+2) x (N+2) transversal coupling matrix
+     */
+    static MatrixXcd from_polynomials_by_realization(
         const Polynomial<Complex>& F,
         const Polynomial<Complex>& P,
         const Polynomial<Complex>& E
@@ -68,13 +99,22 @@ public:
 
     /**
      * Evaluate S11 from coupling matrix at frequency s.
+     * Uses the standard lowpass prototype formula (for para-Hermitian polynomials).
      */
     static Complex S11(const MatrixXcd& cm, Complex s);
 
     /**
      * Evaluate S21 from coupling matrix at frequency s.
+     * Uses the standard lowpass prototype formula (for para-Hermitian polynomials).
      */
     static Complex S21(const MatrixXcd& cm, Complex s);
+
+    /**
+     * Evaluate full 2x2 S-parameter matrix from coupling matrix at frequency s.
+     * This method reconstructs Y from the CM structure and applies inverse Cayley.
+     * Works for both para-Hermitian and NP-modified polynomials.
+     */
+    static Eigen::Matrix2cd eval_S(const MatrixXcd& cm, Complex s);
 
     /**
      * Truncate small values to zero for numerical cleanliness.

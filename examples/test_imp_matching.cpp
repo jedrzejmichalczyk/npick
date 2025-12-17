@@ -19,6 +19,7 @@
 #include "polynomial.hpp"
 #include "chebyshev_filter.hpp"
 #include "coupling_matrix.hpp"
+#include "realization.hpp"
 #include "nevanlinna_pick.hpp"
 #include "impedance_matching.hpp"
 #include "homotopy/path_tracker.hpp"
@@ -618,6 +619,292 @@ int main() {
         std::cout << "\n=== Results Summary ===\n";
         std::cout << "Max |G11| in passband: " << std::fixed << std::setprecision(2)
                  << max_g11_passband << " dB\n";
+
+        // === TEST: State-space realization-based coupling matrix ===
+        std::cout << "\n=== REALIZATION DEBUG: Step-by-step analysis ===\n";
+        {
+            // Get NP-modified polynomials
+            VectorXcd m = NevanlinnaPickNormalized::to_monic(solution);
+            std::vector<Complex> p_coeffs_asc(m.size());
+            std::vector<Complex> r_coeffs_asc(np_problem.r_coeffs().size());
+            for (int i = 0; i < m.size(); ++i) {
+                p_coeffs_asc[i] = m(m.size() - 1 - i);
+            }
+            for (int i = 0; i < np_problem.r_coeffs().size(); ++i) {
+                r_coeffs_asc[i] = np_problem.r_coeffs()(np_problem.r_coeffs().size() - 1 - i);
+            }
+            Polynomial<Complex> F_np(p_coeffs_asc);
+            Polynomial<Complex> P_np(r_coeffs_asc);
+            auto E_np = SpectralFactor::feldtkeller(F_np, P_np);
+
+            std::cout << "NP-modified polynomials:\n";
+            std::cout << "  F degree: " << F_np.degree() << "\n";
+            std::cout << "  P degree: " << P_np.degree() << "\n";
+            std::cout << "  E degree: " << E_np.degree() << "\n";
+
+            // Manually build realization step by step to debug
+            int n = E_np.degree();
+            auto poles = E_np.roots();
+            std::sort(poles.begin(), poles.end(),
+                      [](Complex a, Complex b) { return a.imag() < b.imag(); });
+
+            auto E_deriv = E_np.derivative();
+
+            VectorXcd S11_res(n), S21_res(n);
+            for (int i = 0; i < n; ++i) {
+                Complex p = poles[i];
+                Complex E_deriv_val = E_deriv.evaluate(p);
+                if (std::abs(E_deriv_val) < 1e-15) {
+                    Complex prod(1.0);
+                    for (int j = 0; j < n; ++j) {
+                        if (i != j) prod *= (p - poles[j]);
+                    }
+                    E_deriv_val = prod * E_np.leading_coefficient();
+                }
+                S11_res(i) = F_np.evaluate(p) / E_deriv_val;
+                S21_res(i) = P_np.evaluate(p) / E_deriv_val;
+            }
+
+            // Build S-parameter state-space realization
+            MatrixXcd A_s = MatrixXcd::Zero(n, n);
+            for (int i = 0; i < n; ++i) A_s(i, i) = poles[i];
+
+            VectorXcd tsqrt(n), vovertsqrt(n);
+            for (int i = 0; i < n; ++i) {
+                tsqrt(i) = complex_sqrt(S11_res(i));
+                vovertsqrt(i) = (std::abs(tsqrt(i)) > 1e-15)
+                    ? S21_res(i) / tsqrt(i) : Complex(0);
+            }
+
+            MatrixXcd B_s(n, 2), C_s(2, n);
+            B_s.col(0) = tsqrt;
+            B_s.col(1) = vovertsqrt;
+            C_s.row(0) = tsqrt.transpose();
+            C_s.row(1) = vovertsqrt.transpose();
+            MatrixXcd D_s = MatrixXcd::Identity(2, 2);
+
+            // Test S-realization at interpolation points
+            std::cout << "\n--- Step 1: S-parameter realization H(s) = D + C*(sI-A)^-1*B ---\n";
+            std::cout << "Testing S11 = H(s)[0,0] at interpolation frequencies:\n";
+            double test_freq = freqs[2];  // 0.5556
+            Complex test_s = Complex(0, test_freq);
+
+            MatrixXcd I_n = MatrixXcd::Identity(n, n);
+            MatrixXcd resolvent = (test_s * I_n - A_s).inverse();
+            MatrixXcd H_s = D_s + C_s * resolvent * B_s;
+
+            Complex S11_from_real = H_s(0, 0);
+            Complex S21_from_real = H_s(1, 0);
+            Complex S11_direct = F_np.evaluate(test_s) / E_np.evaluate(test_s);
+            Complex S21_direct = P_np.evaluate(test_s) / E_np.evaluate(test_s);
+            Complex target = std::conj(load_func(test_freq));
+
+            std::cout << "  At s = j*" << test_freq << ":\n";
+            std::cout << "    S11 (realization): " << S11_from_real << "\n";
+            std::cout << "    S11 (F/E direct):  " << S11_direct << "\n";
+            std::cout << "    S11 target:        " << target << "\n";
+            std::cout << "    |real - direct| =  " << std::abs(S11_from_real - S11_direct) << "\n";
+            std::cout << "    |real - target| =  " << std::abs(S11_from_real - target) << "\n";
+            std::cout << "    S21 (realization): " << S21_from_real << "\n";
+            std::cout << "    S21 (P/E direct):  " << S21_direct << "\n";
+
+            // Check all interpolation points for S-realization
+            std::cout << "\n  All interpolation points:\n";
+            bool s_real_ok = true;
+            for (size_t i = 0; i < freqs.size(); ++i) {
+                Complex s_i = Complex(0, freqs[i]);
+                MatrixXcd res_i = (s_i * I_n - A_s).inverse();
+                MatrixXcd H_i = D_s + C_s * res_i * B_s;
+                Complex S11_i = H_i(0, 0);
+                Complex tgt_i = std::conj(loads[i]);
+                double diff = std::abs(S11_i - tgt_i);
+                if (diff > 1e-6) s_real_ok = false;
+                std::cout << "    freq=" << std::fixed << std::setprecision(4) << freqs[i]
+                         << " S11=" << S11_i << " tgt=" << tgt_i
+                         << " |diff|=" << std::scientific << diff
+                         << (diff < 1e-6 ? " OK" : " FAIL") << "\n";
+            }
+            std::cout << "  S-REALIZATION: " << (s_real_ok ? "PASSED" : "FAILED") << "\n";
+
+            // Now check what happens after Cayley transform
+            std::cout << "\n--- Step 2: After Cayley transform (S -> Y) ---\n";
+
+            // Y = (I - S) * (I + S)^{-1}
+            // For state-space: use the formulas
+            MatrixXcd I_2 = MatrixXcd::Identity(2, 2);
+
+            // Direct Cayley: Y = (I-S)*(I+S)^{-1}
+            // At test point, compute Y directly from S
+            MatrixXcd Y_direct = (I_2 - H_s) * (I_2 + H_s).inverse();
+            std::cout << "  Y(s) direct from S at s=j*" << test_freq << ":\n";
+            std::cout << "    Y11 = " << Y_direct(0,0) << "\n";
+            std::cout << "    Y21 = " << Y_direct(1,0) << "\n";
+
+            // The coupling matrix is built from Y-parameters
+            // For a transversal CM: Y11 = sum_k (M_Sk^2 / (s - j*lambda_k))
+            // The eigenvalues lambda_k should come from diagonalizing Y's A matrix
+
+            std::cout << "\n--- Checking coupling matrix formula ---\n";
+            // The standard CM formula for S11:
+            // S11 = -j * m_s^T * (s*I - j*M_inner)^{-1} * m_s
+            // where M_inner is the inner coupling matrix and m_s are source couplings
+
+            // But this assumes a specific structure. Let's verify with the CM we got:
+            std::cout << "  Using get_realization formula on original CM:\n";
+            auto S_cm = get_realization(test_freq, cm);
+            std::cout << "    S11(CM) = " << S_cm(1,1) << "\n";
+            std::cout << "    Target  = " << target << "\n";
+            std::cout << "    |diff|  = " << std::abs(S_cm(1,1) - target) << "\n";
+
+            // The issue: get_realization uses W = M - J + lambda*I_inner
+            // This is the LOSSLESS formula. For lossy/complex M, we need different formula.
+
+            std::cout << "\n--- Testing direct state-space eval on Y-realization ---\n";
+
+            // Build Y realization manually using Cayley formulas
+            // A_y = A_s - B_s * (I + D_s)^{-1} * C_s
+            // But (I + D_s) = 2*I for D_s = I, so (I+D_s)^{-1} = 0.5*I
+            MatrixXcd I_plus_D_inv = (I_2 + D_s).inverse();
+            MatrixXcd A_y = A_s - B_s * I_plus_D_inv * C_s;
+            // For Cayley of (A,B,C,D): the formulas are more complex
+            // Let's use the Realization class directly
+
+            // Actually let's trace through what from_polynomials_by_realization does
+            std::cout << "\n--- Tracing from_polynomials_by_realization ---\n";
+
+            // Import Realization
+            Realization s_real(A_s, C_s, B_s, D_s);
+
+            std::cout << "  S-realization eval at s=j*" << test_freq << ": "
+                     << s_real.eval(test_s)(0,0) << "\n";
+
+            Realization y_real = s_real.cayley();
+            std::cout << "  After Cayley, Y-real eval: " << y_real.eval(test_s)(0,0) << "\n";
+            std::cout << "  Y direct (from S matrix):  " << Y_direct(0,0) << "\n";
+            std::cout << "  |diff| = " << std::abs(y_real.eval(test_s)(0,0) - Y_direct(0,0)) << "\n";
+
+            Realization y_min = y_real.min_real();
+            std::cout << "  After min_real, Y eval:    " << y_min.eval(test_s)(0,0) << "\n";
+
+            Realization y_diag = y_min.diagonalize();
+            std::cout << "  After diagonalize, Y eval: " << y_diag.eval(test_s)(0,0) << "\n";
+
+            Realization y_sym = y_diag.symmetrize();
+            std::cout << "  After symmetrize, Y eval:  " << y_sym.eval(test_s)(0,0) << "\n";
+            std::cout << "  Y target (direct):         " << Y_direct(0,0) << "\n";
+
+            // Check if symmetrize is destroying information
+            std::cout << "\n--- Symmetrize analysis ---\n";
+            std::cout << "  y_diag.B:\n";
+            for (int i = 0; i < std::min(4, (int)y_diag.B.rows()); ++i) {
+                std::cout << "    row " << i << ": " << y_diag.B(i, 0) << ", " << y_diag.B(i, 1) << "\n";
+            }
+            std::cout << "  y_diag.C:\n";
+            for (int i = 0; i < std::min(4, (int)y_diag.C.cols()); ++i) {
+                std::cout << "    col " << i << ": " << y_diag.C(0, i) << ", " << y_diag.C(1, i) << "\n";
+            }
+            std::cout << "  y_sym.B (should equal C^T):\n";
+            for (int i = 0; i < std::min(4, (int)y_sym.B.rows()); ++i) {
+                std::cout << "    row " << i << ": " << y_sym.B(i, 0) << ", " << y_sym.B(i, 1) << "\n";
+            }
+
+            // Key insight: For the coupling matrix to work, we need B = C^T
+            // But this might not be achievable for non-para-Hermitian systems
+            // Let's check if skipping symmetrize helps
+
+            std::cout << "\n--- Testing WITHOUT symmetrize ---\n";
+            // Build CM from y_diag directly (without symmetrize)
+            int n_diag = y_diag.A.rows();
+            MatrixXcd cm_nosym = MatrixXcd::Zero(n_diag + 2, n_diag + 2);
+            Complex j(0, 1);
+            for (int i = 0; i < n_diag; ++i) {
+                cm_nosym(i + 1, i + 1) = j * y_diag.A(i, i);
+            }
+            // Source couplings from C row 0, load from C row 1
+            for (int i = 0; i < n_diag; ++i) {
+                cm_nosym(0, i + 1) = y_diag.C(0, i);      // source -> resonator
+                cm_nosym(i + 1, 0) = y_diag.B(i, 0);      // resonator -> source
+                cm_nosym(n_diag + 1, i + 1) = y_diag.C(1, i);  // load -> resonator
+                cm_nosym(i + 1, n_diag + 1) = y_diag.B(i, 1);  // resonator -> load
+            }
+
+            // Test this asymmetric CM
+            // S = I - 2j * (Y)  where Y = C*(sI - A)^{-1}*B + D
+            // But standard get_realization assumes symmetric structure...
+
+            // Let's compute S directly from Y
+            MatrixXcd Y_at_test = y_diag.eval(test_s);
+            MatrixXcd S_from_Y = (I_2 - Y_at_test) * (I_2 + Y_at_test).inverse();
+            std::cout << "  S from Y (inverse Cayley): " << S_from_Y(0,0) << "\n";
+            std::cout << "  Target S11:                " << target << "\n";
+            std::cout << "  |diff| = " << std::abs(S_from_Y(0,0) - target) << "\n";
+
+            // This tells us if the Y-realization (without symmetrize) gives correct S
+            std::cout << "\n  All interpolation points (S from Y, no symmetrize):\n";
+            bool y_nosym_ok = true;
+            for (size_t i = 0; i < freqs.size(); ++i) {
+                Complex s_i = Complex(0, freqs[i]);
+                MatrixXcd Y_i = y_diag.eval(s_i);
+                MatrixXcd S_i = (I_2 - Y_i) * (I_2 + Y_i).inverse();
+                Complex S11_i = S_i(0, 0);
+                Complex tgt_i = std::conj(loads[i]);
+                double diff = std::abs(S11_i - tgt_i);
+                if (diff > 1e-5) y_nosym_ok = false;
+                std::cout << "    freq=" << std::fixed << std::setprecision(4) << freqs[i]
+                         << " S11=" << S11_i << " |diff|=" << std::scientific << diff
+                         << (diff < 1e-5 ? " OK" : " FAIL") << "\n";
+            }
+            std::cout << "  Y-DIAG (no symmetrize): " << (y_nosym_ok ? "PASSED" : "FAILED") << "\n";
+
+            // === Test from_polynomials_by_realization with get_realization ===
+            std::cout << "\n--- Testing from_polynomials_by_realization + get_realization ---\n";
+            auto cm_by_real = CouplingMatrix::from_polynomials_by_realization(F_np, P_np, E_np);
+            std::cout << "  CM size: " << cm_by_real.rows() << "x" << cm_by_real.cols() << "\n";
+
+            // Print y_sym.A diagonal (eigenvalues)
+            std::cout << "  y_sym.A diagonal (Y-poles):\n";
+            for (int i = 0; i < std::min(4, (int)y_sym.A.rows()); ++i) {
+                std::cout << "    A[" << i << "," << i << "] = " << y_sym.A(i,i) << "\n";
+            }
+            std::cout << "  CM diagonal (should be j*A):\n";
+            for (int i = 0; i < std::min(4, (int)cm_by_real.rows()-2); ++i) {
+                std::cout << "    M[" << i+1 << "," << i+1 << "] = " << cm_by_real(i+1,i+1) << "\n";
+            }
+
+            bool cm_real_ok = true;
+            std::cout << "  Using new CouplingMatrix::eval_S:\n";
+            for (size_t i = 0; i < freqs.size(); ++i) {
+                Complex s_i = Complex(0, freqs[i]);
+                auto S_cmr = CouplingMatrix::eval_S(cm_by_real, s_i);
+                Complex S11_cmr = S_cmr(0, 0);
+                Complex tgt_i = std::conj(loads[i]);
+                double diff = std::abs(S11_cmr - tgt_i);
+                if (diff > 1e-4) cm_real_ok = false;
+                std::cout << "    freq=" << std::fixed << std::setprecision(4) << freqs[i]
+                         << " S11=" << S11_cmr << " tgt=" << tgt_i
+                         << " |diff|=" << std::scientific << diff
+                         << (diff < 1e-4 ? " OK" : " FAIL") << "\n";
+            }
+            std::cout << "  from_polynomials_by_realization + eval_S: " << (cm_real_ok ? "PASSED" : "FAILED") << "\n";
+
+            // === Also test symmetrized Y with inverse Cayley ===
+            std::cout << "\n--- Testing SYMMETRIZED Y with inverse Cayley ---\n";
+            bool y_sym_ok = true;
+            for (size_t i = 0; i < freqs.size(); ++i) {
+                Complex s_i = Complex(0, freqs[i]);
+                MatrixXcd Y_i = y_sym.eval(s_i);
+                MatrixXcd S_i = (I_2 - Y_i) * (I_2 + Y_i).inverse();
+                Complex S11_i = S_i(0, 0);
+                Complex tgt_i = std::conj(loads[i]);
+                double diff = std::abs(S11_i - tgt_i);
+                if (diff > 1e-5) y_sym_ok = false;
+                std::cout << "    freq=" << std::fixed << std::setprecision(4) << freqs[i]
+                         << " S11=" << S11_i << " |diff|=" << std::scientific << diff
+                         << (diff < 1e-5 ? " OK" : " FAIL") << "\n";
+            }
+            std::cout << "  Y-SYM (with symmetrize): " << (y_sym_ok ? "PASSED" : "FAILED") << "\n";
+
+        }
 
         std::cout << "\n=== Test Completed ===\n";
 
