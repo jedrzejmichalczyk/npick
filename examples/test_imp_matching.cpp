@@ -270,28 +270,320 @@ int main() {
         std::cout << "Saved gnuplot script: plot_results.gp\n";
         std::cout << "Run: gnuplot plot_results.gp\n";
 
-        // === Compare S11 from coupling matrix vs p/q ===
-        std::cout << "\n=== Debug: Compare S11 sources ===\n";
-        std::cout << "Freq    |S11_cm|dB  |p/q|dB     |L|dB\n";
-        std::cout << std::string(50, '-') << "\n";
+        // === CRITICAL VERIFICATION: S11 = conj(L) at interpolation points ===
+        std::cout << "\n=== VERIFICATION: S11(cm) = conj(L) at interpolation points ===\n";
+        std::cout << std::setw(10) << "Freq"
+                 << std::setw(20) << "S11(cm)"
+                 << std::setw(20) << "conj(L)"
+                 << std::setw(12) << "|diff|"
+                 << std::setw(8) << "Status" << "\n";
+        std::cout << std::string(70, '-') << "\n";
 
-        for (int i = 0; i <= 10; ++i) {
-            double freq = -1.0 + 2.0 * i / 10;
+        double max_mismatch = 0.0;
+        bool all_match = true;
+        const double tolerance = 1e-5;
 
-            // S11 from coupling matrix
+        for (size_t i = 0; i < freqs.size(); ++i) {
+            double freq = freqs[i];
+
+            // S11 from coupling matrix at interpolation frequency
             auto S = get_realization(freq, cm);
             Complex S11_cm = S(1, 1);
 
-            // p/q from eval_map at this frequency (need to evaluate at single point)
-            // For now just show S11 vs L
-            Complex L = load_func(freq);
+            // Target: conj(L(ω))
+            Complex target = std::conj(loads[i]);
 
-            std::cout << std::fixed << std::setprecision(3)
-                     << std::setw(6) << freq
-                     << std::setw(12) << to_db(S11_cm)
-                     << std::setw(12) << to_db(std::conj(L))
-                     << std::setw(12) << to_db(L) << "\n";
+            double diff = std::abs(S11_cm - target);
+            max_mismatch = std::max(max_mismatch, diff);
+            bool match = diff < tolerance;
+            all_match = all_match && match;
+
+            std::cout << std::fixed << std::setprecision(4)
+                     << std::setw(10) << freq
+                     << "  (" << std::setw(7) << S11_cm.real() << "," << std::setw(7) << S11_cm.imag() << ")"
+                     << "  (" << std::setw(7) << target.real() << "," << std::setw(7) << target.imag() << ")"
+                     << std::setw(12) << std::scientific << std::setprecision(2) << diff
+                     << std::setw(8) << (match ? "OK" : "FAIL") << "\n";
         }
+
+        std::cout << std::string(70, '-') << "\n";
+        std::cout << "Max mismatch: " << std::scientific << std::setprecision(2) << max_mismatch << "\n";
+        std::cout << "MATCHING CRITERION (get_realization): " << (all_match ? "PASSED" : "FAILED") << "\n";
+        std::cout << "(Note: from_polynomials assumes para-Hermitian symmetry which NP breaks)\n";
+
+        // === CORRECT VERIFICATION: Use p/q directly ===
+        std::cout << "\n=== CORRECT VERIFICATION: S11 = p/q vs conj(L) ===\n";
+        std::cout << "(This bypasses the coupling matrix which has symmetry issues)\n";
+        std::cout << std::setw(10) << "Freq"
+                 << std::setw(20) << "p/q"
+                 << std::setw(20) << "conj(L)"
+                 << std::setw(12) << "|diff|"
+                 << std::setw(8) << "Status" << "\n";
+        std::cout << std::string(70, '-') << "\n";
+
+        // Build polynomials from solution
+        VectorXcd m_check = NevanlinnaPickNormalized::to_monic(solution);
+        std::vector<Complex> p_asc(m_check.size()), r_asc(np_problem.r_coeffs().size());
+        for (int i = 0; i < m_check.size(); ++i) p_asc[i] = m_check(m_check.size() - 1 - i);
+        for (int i = 0; i < np_problem.r_coeffs().size(); ++i)
+            r_asc[i] = np_problem.r_coeffs()(np_problem.r_coeffs().size() - 1 - i);
+        Polynomial<Complex> p_check(p_asc);
+        Polynomial<Complex> r_check(r_asc);
+        auto q_check = SpectralFactor::feldtkeller(p_check, r_check);
+
+        double max_mismatch_pq = 0.0;
+        bool all_match_pq = true;
+        const double tolerance_pq = 1e-5;
+
+        for (size_t i = 0; i < freqs.size(); ++i) {
+            Complex s = Complex(0, freqs[i]);
+            Complex S11_pq = p_check.evaluate(s) / q_check.evaluate(s);
+            Complex target = std::conj(loads[i]);
+            double diff = std::abs(S11_pq - target);
+            max_mismatch_pq = std::max(max_mismatch_pq, diff);
+            bool match = diff < tolerance_pq;
+            all_match_pq = all_match_pq && match;
+
+            std::cout << std::fixed << std::setprecision(4)
+                     << std::setw(10) << freqs[i]
+                     << "  (" << std::setw(7) << S11_pq.real() << "," << std::setw(7) << S11_pq.imag() << ")"
+                     << "  (" << std::setw(7) << target.real() << "," << std::setw(7) << target.imag() << ")"
+                     << std::setw(12) << std::scientific << std::setprecision(2) << diff
+                     << std::setw(8) << (match ? "OK" : "FAIL") << "\n";
+        }
+
+        std::cout << std::string(70, '-') << "\n";
+        std::cout << "Max mismatch: " << std::scientific << std::setprecision(2) << max_mismatch_pq << "\n";
+        std::cout << "MATCHING CRITERION (p/q direct): " << (all_match_pq ? "PASSED" : "FAILED") << "\n";
+
+        // === DIAGNOSTIC: Test with SIMPLE polynomials (1st order) ===
+        std::cout << "\n=== DIAGNOSTIC: Simple 1st order filter test ===\n";
+        {
+            // Simple 1st order Butterworth: F = s, P = 1, E = s + 1
+            // S11 = s/(s+1), S21 = 1/(s+1)
+            // At s = j: S11 = j/(j+1) = j(1-j)/2 = (1+j)/2
+            Polynomial<Complex> F_simple({Complex(0), Complex(1)});  // s
+            Polynomial<Complex> P_simple({Complex(1)});              // 1
+            Polynomial<Complex> E_simple({Complex(1), Complex(1)});  // s + 1
+
+            auto cm_simple = CouplingMatrix::from_polynomials(F_simple, P_simple, E_simple);
+
+            Complex s_test = Complex(0, 1);  // s = j
+            Complex S11_expected = s_test / (s_test + Complex(1));  // j/(j+1) = (1+j)/2
+
+            auto S_real = get_realization(1.0, cm_simple);
+            Complex S11_real = S_real(1, 1);
+
+            std::cout << "Simple filter: F=s, P=1, E=s+1\n";
+            std::cout << "At s = j (freq = 1):\n";
+            std::cout << "  S11 expected (F/E):    " << S11_expected << "\n";
+            std::cout << "  S11 (get_realization): " << S11_real << "\n";
+            std::cout << "  |diff| = " << std::abs(S11_real - S11_expected) << "\n";
+
+            std::cout << "\nCoupling matrix (3x3):\n";
+            for (int i = 0; i < cm_simple.rows(); ++i) {
+                std::cout << "  ";
+                for (int j = 0; j < cm_simple.cols(); ++j) {
+                    std::cout << cm_simple(i, j) << " ";
+                }
+                std::cout << "\n";
+            }
+        }
+
+        // === DIAGNOSTIC: Test with ORIGINAL Chebyshev filter ===
+        std::cout << "\n=== DIAGNOSTIC: Original Chebyshev filter ===\n";
+        {
+            // Build coupling matrix from original Chebyshev filter polynomials
+            ChebyshevFilter cheb_filter(order, tzs, return_loss);
+
+            std::cout << "Original F coefficients (should have alternating real/imag):\n  ";
+            for (const auto& c : cheb_filter.F().coefficients) {
+                std::cout << "(" << c.real() << "," << c.imag() << ") ";
+            }
+            std::cout << "\n";
+
+            auto cm_orig = CouplingMatrix::from_polynomials(cheb_filter.F(), cheb_filter.P(), cheb_filter.E());
+
+            double test_f = 0.5;
+            Complex test_s = Complex(0, test_f);
+
+            // S11 direct: F(s)/E(s)
+            Complex F_val = cheb_filter.F().evaluate(test_s);
+            Complex E_val = cheb_filter.E().evaluate(test_s);
+            Complex S11_FE = F_val / E_val;
+
+            // Test get_realization
+            auto S_real = get_realization(test_f, cm_orig);
+            Complex S11_real = S_real(1, 1);
+            std::cout << "At s = j*" << test_f << ":\n";
+            std::cout << "  S11 (F/E):       " << S11_FE << " |" << to_db(S11_FE) << " dB|\n";
+            std::cout << "  S11 (get_real):  " << S11_real << " |" << to_db(S11_real) << " dB|\n";
+            std::cout << "  |diff| = " << std::abs(S11_real - S11_FE) << "\n";
+        }
+
+        // === DIAGNOSTIC: Compare polynomials in calc_coupling_matrix ===
+        std::cout << "\n=== DIAGNOSTIC: Modified p polynomial from NP ===\n";
+        {
+            // Rebuild what calc_coupling_matrix does
+            VectorXcd m = NevanlinnaPickNormalized::to_monic(solution);
+
+            std::cout << "Modified p coefficients (descending order from NP):\n  ";
+            for (int i = 0; i < m.size(); ++i) {
+                std::cout << "(" << m(i).real() << "," << m(i).imag() << ") ";
+            }
+            std::cout << "\n";
+            std::cout << "NOTE: Original has alternating real/imag. Modified has MIXED real+imag.\n";
+            std::cout << "This breaks the symmetry assumed by from_polynomials!\n\n";
+
+            // Convert to ascending order (what build_polynomial does)
+            std::vector<Complex> p_coeffs_asc(m.size());
+            std::vector<Complex> r_coeffs_asc(np_problem.r_coeffs().size());
+            for (int i = 0; i < m.size(); ++i) {
+                p_coeffs_asc[i] = m(m.size() - 1 - i);
+            }
+            for (int i = 0; i < np_problem.r_coeffs().size(); ++i) {
+                r_coeffs_asc[i] = np_problem.r_coeffs()(np_problem.r_coeffs().size() - 1 - i);
+            }
+            Polynomial<Complex> p_poly_test(p_coeffs_asc);
+            Polynomial<Complex> r_poly_test(r_coeffs_asc);
+
+            // Shift polynomials (shift_ should be 0 here)
+            double shift = np_problem.shift();
+            std::cout << "shift_ = " << shift << "\n";
+
+            auto p_shifted_test = p_poly_test.shift(-shift);
+            auto r_shifted_test = r_poly_test.shift(-shift);
+            auto e_poly_test = SpectralFactor::feldtkeller(p_shifted_test, r_shifted_test);
+
+            // Build coupling matrix the same way calc_coupling_matrix does
+            auto cm_test = CouplingMatrix::from_polynomials(p_shifted_test, r_shifted_test, e_poly_test);
+
+            // Test S11 at freq 0.5
+            double test_f = 0.5556;
+            Complex test_s = Complex(0, test_f);
+
+            auto S_test = get_realization(test_f, cm_test);
+            Complex S11_test = S_test(1, 1);
+
+            // Direct p/e evaluation
+            Complex p_val = p_shifted_test.evaluate(test_s);
+            Complex e_val = e_poly_test.evaluate(test_s);
+            Complex S11_pe = p_val / e_val;
+
+            std::cout << "At s = j*" << test_f << ":\n";
+            std::cout << "  S11 (get_real from rebuilt CM): " << S11_test << "\n";
+            std::cout << "  S11 (p/e direct):               " << S11_pe << "\n";
+            std::cout << "  |get_real - p/e| = " << std::abs(S11_test - S11_pe) << "\n";
+
+            // Check if cm_test equals cm from before
+            std::cout << "  cm_test == cm: " << (cm.isApprox(cm_test, 1e-10) ? "YES" : "NO") << "\n";
+
+            // Verify Feldtkeller equation: |e|² = |p|² + |r|²
+            auto p_para = p_shifted_test.para_conjugate();
+            auto r_para = r_shifted_test.para_conjugate();
+            auto e_para = e_poly_test.para_conjugate();
+
+            // |p|² = p * p*
+            auto pp_star = p_shifted_test * p_para;
+            auto rr_star = r_shifted_test * r_para;
+            auto ee_star = e_poly_test * e_para;
+
+            auto sum = pp_star + rr_star;
+
+            std::cout << "\nFeldtkeller verification (|e|² should equal |p|² + |r|²):\n";
+            std::cout << "  |e|² coeffs:        ";
+            for (const auto& c : ee_star.coefficients) {
+                std::cout << "(" << c.real() << "," << c.imag() << ") ";
+            }
+            std::cout << "\n  |p|² + |r|² coeffs: ";
+            for (const auto& c : sum.coefficients) {
+                std::cout << "(" << c.real() << "," << c.imag() << ") ";
+            }
+            std::cout << "\n";
+
+            // Check coefficient-wise difference
+            double max_diff = 0;
+            int max_deg = std::max(ee_star.degree(), sum.degree());
+            for (int i = 0; i <= max_deg; ++i) {
+                Complex ee_c = (i < ee_star.coefficients.size()) ? ee_star.coefficients[i] : Complex(0);
+                Complex sum_c = (i < sum.coefficients.size()) ? sum.coefficients[i] : Complex(0);
+                max_diff = std::max(max_diff, std::abs(ee_c - sum_c));
+            }
+            std::cout << "  Max coefficient difference: " << max_diff << "\n";
+
+            // Print Y-parameter poles to check if they're purely imaginary
+            double k_np = std::pow(-1, p_shifted_test.degree() + 1);
+            double m_sgn = std::pow(-1, p_shifted_test.degree());
+            auto e_para_np = e_poly_test.para_conjugate();
+            auto p_para_np = p_shifted_test.para_conjugate();
+            auto down = e_poly_test + p_shifted_test + (e_para_np + p_para_np) * m_sgn;
+            auto y_poles_np = down.roots();
+
+            std::cout << "\nY-parameter poles (should be purely imaginary for lossless):\n";
+            for (const auto& pole : y_poles_np) {
+                std::cout << "  " << pole << " (|Re|=" << std::abs(pole.real()) << ")\n";
+            }
+
+            // For comparison, get original Chebyshev filter Y-poles
+            ChebyshevFilter cheb_cmp(order, tzs, return_loss);
+            auto E_cmp = cheb_cmp.E();
+            auto F_cmp = cheb_cmp.F();
+            auto E_para_cmp = E_cmp.para_conjugate();
+            auto F_para_cmp = F_cmp.para_conjugate();
+            double m_cmp = std::pow(-1, F_cmp.degree());
+            auto down_cmp = E_cmp + F_cmp + (E_para_cmp + F_para_cmp) * m_cmp;
+            auto y_poles_orig = down_cmp.roots();
+
+            std::cout << "\nOriginal Chebyshev Y-poles:\n";
+            for (const auto& pole : y_poles_orig) {
+                std::cout << "  " << pole << " (|Re|=" << std::abs(pole.real()) << ")\n";
+            }
+        }
+
+        // === DIAGNOSTIC: Compare multiple S11 computation methods ===
+        std::cout << "\n=== DIAGNOSTIC: S11 computation methods (after NP) ===\n";
+        std::cout << "Testing at frequency ω = 0.5556 (one of the interpolation points)\n";
+
+        double test_freq = freqs[2];  // 0.5556
+        Complex test_s = Complex(0, test_freq);
+
+        // Method 1: get_realization (full matrix inversion)
+        auto S_realization = get_realization(test_freq, cm);
+        Complex S11_realization = S_realization(1, 1);
+
+        // Method 2: CouplingMatrix::S11
+        Complex S11_formula = CouplingMatrix::S11(cm, test_s);
+
+        // Method 3: Direct p(s)/q(s) from NP solution
+        VectorXcd m = NevanlinnaPickNormalized::to_monic(solution);
+        // Convert from descending [p_{n-1},...,p_0] to ascending [p_0,...,p_{n-1}]
+        std::vector<Complex> p_coeffs_asc(m.size());
+        std::vector<Complex> r_coeffs_asc(np_problem.r_coeffs().size());
+        for (int i = 0; i < m.size(); ++i) {
+            p_coeffs_asc[i] = m(m.size() - 1 - i);
+        }
+        for (int i = 0; i < np_problem.r_coeffs().size(); ++i) {
+            r_coeffs_asc[i] = np_problem.r_coeffs()(np_problem.r_coeffs().size() - 1 - i);
+        }
+        Polynomial<Complex> p_poly(p_coeffs_asc);
+        Polynomial<Complex> r_poly(r_coeffs_asc);
+        auto q_poly = SpectralFactor::feldtkeller(p_poly, r_poly);
+        Complex p_val = p_poly.evaluate(test_s);
+        Complex q_val = q_poly.evaluate(test_s);
+        Complex S11_pq = p_val / q_val;
+
+        std::cout << "  S11 (get_realization):  " << S11_realization << " |" << to_db(S11_realization) << " dB|\n";
+        std::cout << "  S11 (CM::S11 formula):  " << S11_formula << " |" << to_db(S11_formula) << " dB|\n";
+        std::cout << "  S11 (p/q direct):       " << S11_pq << " |" << to_db(S11_pq) << " dB|\n";
+        std::cout << "  conj(L):                " << std::conj(load_func(test_freq)) << " |" << to_db(load_func(test_freq)) << " dB|\n";
+
+        std::cout << "\nDifferences:\n";
+        std::cout << "  |get_realization - conj(L)| = " << std::abs(S11_realization - std::conj(load_func(test_freq))) << "\n";
+        std::cout << "  |CM::S11 - conj(L)| = " << std::abs(S11_formula - std::conj(load_func(test_freq))) << "\n";
+        std::cout << "  |p/q - conj(L)| = " << std::abs(S11_pq - std::conj(load_func(test_freq))) << "\n";
+        std::cout << "  |get_realization - CM::S11| = " << std::abs(S11_realization - S11_formula) << "\n";
+        std::cout << "  |get_realization - p/q| = " << std::abs(S11_realization - S11_pq) << "\n";
+        std::cout << "  |CM::S11 - p/q| = " << std::abs(S11_formula - S11_pq) << "\n";
 
         // === Print summary table for passband ===
         std::cout << "\n=== Passband Response (freq in [-1, 1]) ===\n";
