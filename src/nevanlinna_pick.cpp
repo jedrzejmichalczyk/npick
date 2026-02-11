@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <numeric>
 #include <iostream>
+#include <stdexcept>
 
 namespace np {
 
@@ -15,6 +16,25 @@ NevanlinnaPick::NevanlinnaPick(
 )
     : order_(static_cast<int>(loads.size()))
 {
+    if (loads.empty()) {
+        throw std::invalid_argument("NevanlinnaPick: loads must not be empty");
+    }
+    if (freqs.size() != loads.size()) {
+        throw std::invalid_argument("NevanlinnaPick: loads and freqs must have the same size");
+    }
+    if (transmission_zeros.size() > loads.size()) {
+        throw std::invalid_argument(
+            "NevanlinnaPick: transmission_zeros size must be <= interpolation order");
+    }
+    if (return_loss <= 0.0 || !std::isfinite(return_loss)) {
+        throw std::invalid_argument("NevanlinnaPick: return_loss must be finite and > 0");
+    }
+    for (double f : freqs) {
+        if (!std::isfinite(f)) {
+            throw std::invalid_argument("NevanlinnaPick: frequencies must be finite");
+        }
+    }
+
     // Compute frequency shift (mean)
     shift_ = std::accumulate(freqs.begin(), freqs.end(), 0.0) / freqs.size();
 
@@ -57,6 +77,9 @@ VectorXcd NevanlinnaPick::eval_map(const VectorXcd& p_coeffs) const {
         Complex s = Complex(0, freqs_[k]);
         Complex p_val = p_poly.evaluate(s);
         Complex q_val = q_poly.evaluate(s);
+        if (std::abs(q_val) < 1e-15) {
+            throw std::runtime_error("NevanlinnaPick::eval_map: spectral factor vanished at evaluation point");
+        }
         result(k) = p_val / q_val;
     }
 
@@ -186,9 +209,12 @@ Polynomial<Complex> NevanlinnaPick::solve_bezout(
     // The Bezout equation has null space: dq_null = i·β·q
     // Project out to make leading coefficient have zero imaginary part
     if (n > 0 && n <= static_cast<int>(q.coefficients.size())) {
-        double beta = dq_coeffs[n - 1].imag() / q.coefficients[n - 1].real();
-        for (int i = 0; i < n && i < static_cast<int>(q.coefficients.size()); ++i) {
-            dq_coeffs[i] -= Complex(0, 1) * beta * q.coefficients[i];
+        double denom = q.coefficients[n - 1].real();
+        if (std::abs(denom) > 1e-15) {
+            double beta = dq_coeffs[n - 1].imag() / denom;
+            for (int i = 0; i < n && i < static_cast<int>(q.coefficients.size()); ++i) {
+                dq_coeffs[i] -= Complex(0, 1) * beta * q.coefficients[i];
+            }
         }
     }
 

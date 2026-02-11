@@ -1,6 +1,7 @@
 #include "chebyshev_filter.hpp"
 #include <limits>
 #include <algorithm>
+#include <stdexcept>
 
 namespace np {
 
@@ -13,6 +14,16 @@ ChebyshevFilter::ChebyshevFilter(
     , tzs_(transmission_zeros)
     , return_loss_(return_loss_db)
 {
+    if (order_ <= 0) {
+        throw std::invalid_argument("ChebyshevFilter: order must be > 0");
+    }
+    if (return_loss_ <= 0.0 || !std::isfinite(return_loss_)) {
+        throw std::invalid_argument("ChebyshevFilter: return_loss_db must be finite and > 0");
+    }
+    if (static_cast<int>(tzs_.size()) > order_) {
+        throw std::invalid_argument("ChebyshevFilter: transmission_zeros size must be <= order");
+    }
+
     // Pad transmission zeros with infinity if needed
     while (static_cast<int>(tzs_.size()) < order_) {
         tzs_.push_back(Complex(std::numeric_limits<double>::infinity(),

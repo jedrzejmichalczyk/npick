@@ -4,6 +4,7 @@
 #include <vector>
 #include <algorithm>
 #include <cmath>
+#include <stdexcept>
 #include <Eigen/Eigenvalues>
 
 namespace np {
@@ -199,6 +200,18 @@ public:
             c /= lc;
         }
         return lc;
+    }
+
+    // Compute the derivative polynomial
+    Polynomial<T> derivative() const {
+        int n = degree();
+        if (n < 1) return Polynomial<T>({T(0)});
+
+        std::vector<T> deriv_coeffs(n);
+        for (int i = 1; i <= n; ++i) {
+            deriv_coeffs[i - 1] = coefficients[i] * T(static_cast<double>(i));
+        }
+        return Polynomial<T>(deriv_coeffs);
     }
 
     // Synthetic division: returns (quotient, remainder)

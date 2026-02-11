@@ -37,6 +37,16 @@ public:
      */
     VectorXcd run(const VectorXcd& x0) {
         const double EPS = 1e-12;
+        if (h >= 0.0) {
+            throw std::invalid_argument("Path tracker: step size h must be negative");
+        }
+        if (x0.size() != homotopy_->get_num_variables()) {
+            throw std::invalid_argument("Path tracker: x0 size does not match problem dimension");
+        }
+
+        ts_.clear();
+        xs_.clear();
+
         double t = 1.0;
         VectorXcd v = x0;
 

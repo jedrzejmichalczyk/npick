@@ -6,6 +6,7 @@
 #include "coupling_matrix.hpp"
 #include "nevanlinna_pick.hpp"
 #include "homotopy/path_tracker.hpp"
+#include "optimization/nelder_mead.hpp"
 #include <functional>
 #include <vector>
 
@@ -14,13 +15,18 @@ namespace np {
 /**
  * High-level interface for impedance matching network synthesis.
  *
- * Given a complex load impedance function Z_L(ω), synthesizes a matching
- * network (as a coupling matrix) that achieves optimal reflection coefficient
- * across the specified frequency band.
+ * Given a complex load reflection function L(ω), synthesizes a matching
+ * network (as a coupling matrix) that minimizes the worst-case matched
+ * reflection coefficient G11 across the specified frequency band.
  *
- * The algorithm uses Nevanlinna-Pick interpolation with homotopy continuation
- * to find a Schur function that interpolates the target load reflection
- * coefficients at Chebyshev node frequencies.
+ * The algorithm uses:
+ * 1. Nevanlinna-Pick interpolation with homotopy continuation to find
+ *    a Schur function matching S11 = conj(L) at interpolation frequencies
+ * 2. Nelder-Mead optimization to find the optimal interpolation frequencies
+ *    that minimize max|G11| over the passband (MinMax problem)
+ *
+ * G11 = S11 + S12*S21*L / (1 - S22*L) is the overall reflection when
+ * the matching network is connected to the load.
  */
 class ImpedanceMatching {
 public:
@@ -29,13 +35,12 @@ public:
     /**
      * Construct an impedance matching problem.
      *
-     * @param load Function returning complex load impedance Z_L at frequency ω
+     * @param load Function returning complex load reflection L at frequency ω
      * @param order Filter order (number of resonators)
      * @param transmission_zeros Finite transmission zeros (empty for all-pole)
-     * @param return_loss_db Initial return loss specification (dB)
-     * @param freq_left Left edge of passband
-     * @param freq_right Right edge of passband
-     * @param z0 Reference impedance (default 50 Ω)
+     * @param return_loss_db Return loss specification (dB)
+     * @param freq_left Left edge of passband (normalized)
+     * @param freq_right Right edge of passband (normalized)
      */
     ImpedanceMatching(
         LoadFunction load,
@@ -43,48 +48,84 @@ public:
         const std::vector<Complex>& transmission_zeros,
         double return_loss_db,
         double freq_left,
-        double freq_right,
-        double z0 = 50.0
+        double freq_right
     );
 
     /**
      * Run the impedance matching optimization.
+     *
+     * Uses Nelder-Mead to find optimal interpolation frequencies that
+     * minimize max|G11| over the passband.
      *
      * @return Coupling matrix of the synthesized matching network
      */
     MatrixXcd run();
 
     /**
-     * Get the interpolation frequencies (Chebyshev nodes).
+     * Run single NP iteration with given interpolation frequencies.
+     *
+     * @param interp_freqs Interpolation frequencies
+     * @return Coupling matrix (or empty if failed)
+     */
+    MatrixXcd run_single(const std::vector<double>& interp_freqs);
+
+    /**
+     * Compute max|G11| cost for given interpolation frequencies.
+     *
+     * @param interp_freqs Interpolation frequencies
+     * @return Maximum |G11| over passband (or large value if failed)
+     */
+    double compute_cost(const std::vector<double>& interp_freqs);
+
+    /**
+     * Evaluate G11 (matched reflection) at a frequency.
+     *
+     * @param cm Coupling matrix
+     * @param freq Frequency
+     * @return G11 = S11 + S12*S21*L / (1 - S22*L)
+     */
+    Complex eval_G11(const MatrixXcd& cm, double freq) const;
+
+    /**
+     * Get the optimized interpolation frequencies.
      */
     const std::vector<double>& interpolation_freqs() const { return freqs_; }
 
     /**
-     * Get the target load reflection coefficients at interpolation frequencies.
+     * Get the final coupling matrix.
      */
-    const std::vector<Complex>& target_loads() const { return target_loads_; }
+    const MatrixXcd& coupling_matrix() const { return cm_; }
 
-    // Configuration
-    double path_tracker_h = -0.05;      // Initial step size
-    double path_tracker_run_tol = 1e-3;  // Tolerance during tracking
-    double path_tracker_final_tol = 1e-7; // Final tolerance
+    /**
+     * Get the achieved max|G11| in dB.
+     */
+    double achieved_return_loss_db() const { return achieved_rl_db_; }
+
+    // Path tracker configuration
+    double path_tracker_h = -0.05;
+    double path_tracker_run_tol = 1e-3;
+    double path_tracker_final_tol = 1e-7;
+
+    // Optimizer configuration
+    double optimizer_tolerance = 1e-4;
+    int optimizer_max_iterations = 500;
+    int cost_eval_points = 101;  // Points for max|G11| evaluation
+
+    // Verbosity
+    bool verbose = false;
 
 private:
-    /**
-     * Convert load impedance to reflection coefficient.
-     * Γ = (Z_L - Z_0) / (Z_L + Z_0)
-     */
-    Complex impedance_to_gamma(Complex z_l) const;
-
     LoadFunction load_;
     int order_;
     std::vector<Complex> tzs_;
     double return_loss_;
     double freq_left_;
     double freq_right_;
-    double z0_;
+
+    // Results
     std::vector<double> freqs_;
-    std::vector<Complex> target_loads_;
+    MatrixXcd cm_;
+    double achieved_rl_db_;
 };
 
 } // namespace np

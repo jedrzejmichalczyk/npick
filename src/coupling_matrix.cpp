@@ -271,7 +271,11 @@ MatrixXcd CouplingMatrix::calc_rotation(const MatrixXcd& M, int k, int l, int m,
     if (std::abs(M(m, n_idx)) > 1e-14) {
         theta = -std::atan(c * M(k, l) / M(m, n_idx));
     } else if (std::abs(M(k, l)) > 1e-14) {
-        double sign = (c * M(k, l).real() / M(m, n_idx).real() > 0) ? 1.0 : -1.0;
+        double signed_numerator = c * M(k, l).real();
+        if (std::abs(signed_numerator) < 1e-14) {
+            signed_numerator = c * M(k, l).imag();
+        }
+        double sign = (signed_numerator >= 0.0) ? 1.0 : -1.0;
         theta = Complex(-0.5 * PI * sign);
     }
 
