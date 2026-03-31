@@ -22,8 +22,8 @@ namespace np {
  * The algorithm uses:
  * 1. Nevanlinna-Pick interpolation with homotopy continuation to find
  *    a Schur function matching S11 = conj(L) at interpolation frequencies
- * 2. Nelder-Mead optimization to find the optimal interpolation frequencies
- *    that minimize max|G11| over the passband (MinMax problem)
+ * 2. An exchange loop that moves interpolation frequencies toward the
+ *    worst-case G11 peaks, with an optional short Nelder-Mead polish
  *
  * G11 = S11 + S12*S21*L / (1 - S22*L) is the overall reflection when
  * the matching network is connected to the load.
@@ -54,8 +54,9 @@ public:
     /**
      * Run the impedance matching optimization.
      *
-     * Uses Nelder-Mead to find optimal interpolation frequencies that
-     * minimize max|G11| over the passband.
+     * Uses an exchange loop to update interpolation frequencies toward
+     * the worst-case G11 peaks. An optional short Nelder-Mead polish can
+     * be enabled afterward by setting optimizer_max_iterations > 0.
      *
      * @return Coupling matrix of the synthesized matching network
      */
@@ -76,6 +77,19 @@ public:
      * @return Maximum |G11| over passband (or large value if failed)
      */
     double compute_cost(const std::vector<double>& interp_freqs);
+
+    /**
+     * Run equiripple Newton optimizer.
+     *
+     * Solves for interpolation frequencies where all G11 peaks between
+     * consecutive interpolation points are equal (equioscillation).
+     * Uses Newton's method on the peak-difference system with
+     * finite-difference Jacobian.
+     *
+     * @param initial_freqs Starting interpolation frequencies
+     * @return Coupling matrix (or empty if failed)
+     */
+    MatrixXcd run_equiripple(const std::vector<double>& initial_freqs);
 
     /**
      * Evaluate G11 (matched reflection) at a frequency.
@@ -106,15 +120,45 @@ public:
     double path_tracker_run_tol = 1e-3;
     double path_tracker_final_tol = 1e-7;
 
-    // Optimizer configuration
+    // Optimizer configuration (Nelder-Mead on interpolation frequencies)
+    double optimizer_initial_step = 0.02;
     double optimizer_tolerance = 1e-4;
-    int optimizer_max_iterations = 500;
-    int cost_eval_points = 101;  // Points for max|G11| evaluation
+    int optimizer_max_iterations = 50;
+    int optimizer_iteration_cap = 24;
+    int cost_eval_points = 41;  // Points for max|G11| evaluation
+    int cost_peak_candidates = 0;  // 0 => derive from problem order
+    int cost_peak_refine_iterations = 4;
+    int cost_peak_refine_subdivisions = 8;
+    bool use_symmetric_parameterization = true;
+    bool fix_symmetric_band_edges = true;
+    double symmetry_detection_tolerance = 1e-6;
+
+    // Equiripple Newton optimizer
+    int equiripple_max_iterations = 15;
+    double equiripple_fd_delta = 1e-5;
+    int equiripple_peak_eval_points = 201;
+    int equiripple_peak_refine_steps = 6;
+
+    // Exchange algorithm (experimental, disabled by default)
+    int exchange_iterations = 0;
+    int exchange_eval_points = 161;
+    double exchange_relaxation = 1.0;
 
     // Verbosity
     bool verbose = false;
 
 private:
+    std::vector<double> canonicalize_interpolation_freqs(const std::vector<double>& interp_freqs) const;
+    bool supports_symmetric_optimization() const;
+    std::vector<double> compress_symmetric_freqs(const std::vector<double>& interp_freqs) const;
+    std::vector<double> expand_symmetric_freqs(const std::vector<double>& positive_freqs) const;
+    std::vector<double> select_exchange_freqs(const MatrixXcd& cm, bool symmetric) const;
+    double compute_response_cost(const MatrixXcd& cm) const;
+    double refine_peak_magnitude(const MatrixXcd& cm, double left, double right) const;
+
+    std::vector<double> find_interval_peaks(const MatrixXcd& cm,
+                                            const std::vector<double>& interp_freqs) const;
+
     LoadFunction load_;
     int order_;
     std::vector<Complex> tzs_;

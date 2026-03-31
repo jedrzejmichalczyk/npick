@@ -8,6 +8,9 @@
 
 namespace np {
 
+HomotopyBase::~HomotopyBase() = default;
+NevanlinnaPick::~NevanlinnaPick() = default;
+
 NevanlinnaPick::NevanlinnaPick(
     const std::vector<Complex>& loads,
     const std::vector<double>& freqs,
@@ -94,46 +97,134 @@ MatrixXcd NevanlinnaPick::eval_grad(const VectorXcd& p_coeffs) const {
     int N = static_cast<int>(p_coeffs.size());
     int M = static_cast<int>(freqs_.size());
 
-    // Evaluation points
+    // Evaluation points and precomputed values
     std::vector<Complex> s(M);
-    for (int k = 0; k < M; ++k) {
-        s[k] = Complex(0, freqs_[k]);
-    }
-
-    // Precompute polynomial values
     std::vector<Complex> p_vals(M), q_vals(M);
     for (int k = 0; k < M; ++k) {
+        s[k] = Complex(0, freqs_[k]);
         p_vals[k] = p_poly.evaluate(s[k]);
         q_vals[k] = q_poly.evaluate(s[k]);
     }
 
     auto p_para = p_poly.para_conjugate();
+    auto q_para = q_poly.para_conjugate();
+
+    // Build and factor the Bezout matrix ONCE for all coefficients.
+    // The LHS matrix depends only on q (same for all dp perturbations).
+    int q_deg = q_poly.degree();
+    int lhs_max_deg = q_deg + (N - 1);
+    int num_eqs = lhs_max_deg + 1;
+
+    // Check if q has real coefficients (simplified system)
+    double max_imag_q = 0, max_real_q = 0;
+    for (const auto& c : q_poly.coefficients) {
+        max_imag_q = std::max(max_imag_q, std::abs(c.imag()));
+        max_real_q = std::max(max_real_q, std::abs(c.real()));
+    }
+    bool q_is_real = max_imag_q < 1e-10 * std::max(1.0, max_real_q);
 
     MatrixXcd result(M, N);
 
-    // For each coefficient j, compute gradient
-    for (int j = 0; j < N; ++j) {
-        // dp = s^{N-1-j} (perturbation of coefficient j)
-        int deg = N - 1 - j;
-        std::vector<Complex> dp_coeffs(deg + 1, Complex(0));
-        dp_coeffs[deg] = Complex(1);
-        Polynomial<Complex> dp(dp_coeffs);
-        auto dp_para = dp.para_conjugate();
+    if (q_is_real) {
+        // Real q: dq has n real unknowns
+        Eigen::MatrixXd A = Eigen::MatrixXd::Zero(2 * num_eqs, N);
+        for (int k = 0; k < num_eqs; ++k) {
+            for (int i = 0; i < N; ++i) {
+                int j = k - i;
+                if (j < 0 || j > q_deg) continue;
+                Complex q_para_c = q_para.coefficients[j];
+                Complex q_c = q_poly.coefficients[j];
+                double sign_i = std::pow(-1.0, i);
+                Complex coeff = q_para_c + q_c * sign_i;
+                A(2 * k, i) += coeff.real();
+                A(2 * k + 1, i) += coeff.imag();
+            }
+        }
+        auto qr = A.colPivHouseholderQr();
 
-        // RHS of Bezout equation: dq·q* + q·dq* = dp·p* + p·dp*
-        auto rhs = dp * p_para + p_poly * dp_para;
+        for (int j = 0; j < N; ++j) {
+            int deg = N - 1 - j;
+            std::vector<Complex> dp_c(deg + 1, Complex(0));
+            dp_c[deg] = Complex(1);
+            Polynomial<Complex> dp(dp_c);
+            auto rhs_poly = dp * p_para + p_poly * dp.para_conjugate();
 
-        // Solve Bezout equation
-        auto dq = solve_bezout(q_poly, rhs, N);
+            int rhs_deg = rhs_poly.degree();
+            Eigen::VectorXd b = Eigen::VectorXd::Zero(2 * num_eqs);
+            for (int k = 0; k < num_eqs; ++k) {
+                Complex rc = (k <= rhs_deg) ? rhs_poly.coefficients[k] : Complex(0);
+                b(2 * k) = rc.real();
+                b(2 * k + 1) = rc.imag();
+            }
 
-        // Compute gradient at each interpolation point
-        for (int k = 0; k < M; ++k) {
-            // ∂p/∂p_j evaluated at s[k] is s[k]^{N-1-j}
-            Complex dp_val = std::pow(s[k], deg);
-            Complex dq_val = dq.evaluate(s[k]);
+            Eigen::VectorXd sol = qr.solve(b);
+            std::vector<Complex> dq_c(N);
+            for (int i = 0; i < N; ++i)
+                dq_c[i] = Complex(sol(i), 0);
+            Polynomial<Complex> dq(dq_c);
 
-            // Quotient rule: ∂(p/q)/∂p_j = (∂p·q - p·∂q) / q²
-            result(k, j) = (dp_val * q_vals[k] - p_vals[k] * dq_val) / (q_vals[k] * q_vals[k]);
+            for (int k = 0; k < M; ++k) {
+                Complex dp_val = std::pow(s[k], deg);
+                Complex dq_val = dq.evaluate(s[k]);
+                result(k, j) = (dp_val * q_vals[k] - p_vals[k] * dq_val)
+                             / (q_vals[k] * q_vals[k]);
+            }
+        }
+    } else {
+        // Complex q: dq has 2n real unknowns
+        Eigen::MatrixXd A = Eigen::MatrixXd::Zero(2 * num_eqs, 2 * N);
+        for (int k = 0; k < num_eqs; ++k) {
+            for (int i = 0; i < N; ++i) {
+                int j_idx = k - i;
+                if (j_idx < 0 || j_idx > q_deg) continue;
+                Complex qp_j = q_para.coefficients[j_idx];
+                Complex q_j = q_poly.coefficients[j_idx];
+                double sign = std::pow(-1.0, i);
+                A(2*k,   2*i)   += qp_j.real() + sign * q_j.real();
+                A(2*k,   2*i+1) += -qp_j.imag() + sign * q_j.imag();
+                A(2*k+1, 2*i)   += qp_j.imag() + sign * q_j.imag();
+                A(2*k+1, 2*i+1) += qp_j.real() - sign * q_j.real();
+            }
+        }
+        auto qr = A.colPivHouseholderQr();
+
+        for (int j = 0; j < N; ++j) {
+            int deg = N - 1 - j;
+            std::vector<Complex> dp_c(deg + 1, Complex(0));
+            dp_c[deg] = Complex(1);
+            Polynomial<Complex> dp(dp_c);
+            auto rhs_poly = dp * p_para + p_poly * dp.para_conjugate();
+
+            int rhs_deg = rhs_poly.degree();
+            Eigen::VectorXd b = Eigen::VectorXd::Zero(2 * num_eqs);
+            for (int k = 0; k < num_eqs; ++k) {
+                Complex rc = (k <= rhs_deg) ? rhs_poly.coefficients[k] : Complex(0);
+                b(2 * k) = rc.real();
+                b(2 * k + 1) = rc.imag();
+            }
+
+            Eigen::VectorXd sol = qr.solve(b);
+            std::vector<Complex> dq_c(N);
+            for (int i = 0; i < N; ++i)
+                dq_c[i] = Complex(sol(2*i), sol(2*i+1));
+
+            // Null-space projection (remove iβq component)
+            if (N > 0 && N <= static_cast<int>(q_poly.coefficients.size())) {
+                double denom = q_poly.coefficients[N - 1].real();
+                if (std::abs(denom) > 1e-15) {
+                    double beta = dq_c[N - 1].imag() / denom;
+                    for (int i = 0; i < N && i < static_cast<int>(q_poly.coefficients.size()); ++i)
+                        dq_c[i] -= Complex(0, 1) * beta * q_poly.coefficients[i];
+                }
+            }
+            Polynomial<Complex> dq(dq_c);
+
+            for (int k = 0; k < M; ++k) {
+                Complex dp_val = std::pow(s[k], deg);
+                Complex dq_val = dq.evaluate(s[k]);
+                result(k, j) = (dp_val * q_vals[k] - p_vals[k] * dq_val)
+                             / (q_vals[k] * q_vals[k]);
+            }
         }
     }
 
@@ -362,8 +453,9 @@ MatrixXcd NevanlinnaPickNormalized::calc_coupling_matrix(const VectorXcd& x) con
     // Compute spectral factor
     auto e_poly = SpectralFactor::feldtkeller(p_shifted, r_shifted);
 
-    // Build coupling matrix
-    return CouplingMatrix::from_polynomials(p_shifted, r_shifted, e_poly);
+    // The NP solution produces general complex polynomials (not para-Hermitian),
+    // so the realization-based builder is required.
+    return CouplingMatrix::from_polynomials_by_realization(p_shifted, r_shifted, e_poly);
 }
 
 } // namespace np

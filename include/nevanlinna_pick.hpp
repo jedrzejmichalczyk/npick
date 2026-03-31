@@ -37,6 +37,8 @@ public:
         double return_loss
     );
 
+    ~NevanlinnaPick() override;
+
     // HomotopyBase interface
     VectorXcd calc_homotopy_function(const VectorXcd& x, double t) override;
     VectorXcd calc_path_derivative(const VectorXcd& x, double t) override;

@@ -84,8 +84,7 @@ private:
         VectorXcd Ht = -homotopy_->calc_path_derivative(x, t);
 
         // Solve J * dxdt = Ht
-        Eigen::JacobiSVD<MatrixXcd> svd(J, Eigen::ComputeThinU | Eigen::ComputeThinV);
-        dxdt = svd.solve(Ht);
+        dxdt = J.colPivHouseholderQr().solve(Ht);
     }
 
     void dx_step(double h, double t, const VectorXcd& x, const VectorXcd& dxdt,

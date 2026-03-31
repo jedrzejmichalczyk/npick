@@ -45,7 +45,8 @@ MatrixXcd CouplingMatrix::from_polynomials(
 ) {
     // Y-parameter approach for transversal coupling matrix synthesis.
     // This works correctly for para-Hermitian polynomials (standard lowpass prototypes).
-    // For non-para-Hermitian polynomials (NP-modified), use coupling_matrix_by_homotopy().
+    // For non-para-Hermitian polynomials (NP-modified), use
+    // from_polynomials_by_realization().
     //
     // The Y-parameter transformation naturally maps S-parameter poles to
     // imaginary-axis poles suitable for the coupling matrix formulation.
@@ -339,54 +340,46 @@ Complex CouplingMatrix::S21(const MatrixXcd& cm, Complex s) {
 }
 
 Eigen::Matrix2cd CouplingMatrix::eval_S(const MatrixXcd& cm, Complex s) {
-    // Reconstruct Y-parameters from coupling matrix and apply inverse Cayley.
-    // CM structure (transversal):
-    //   - Diagonal cm(k+1, k+1) = j * A(k,k) where A is Y-realization state matrix
-    //   - cm(0, k+1) = cm(k+1, 0) = m_s[k] = source coupling
-    //   - cm(N-1, k+1) = cm(k+1, N-1) = m_l[k] = load coupling
-    //
-    // Y-realization: Y = B^T * (sI - A)^{-1} * B where B = [m_s; m_l]^T
-    // A(k,k) = cm(k+1, k+1) / j = -j * cm(k+1, k+1)
-
-    int N = cm.rows();
-    int n = N - 2;
+    // Evaluate the coupling matrix using the same realization convention as the
+    // original C# benchmark. The CM lives in the lowpass-frequency variable
+    // lambda, with s = j * lambda on the imaginary axis.
+    const int N = cm.rows();
+    const int n = N - 2;
 
     if (n <= 0) {
-        // Trivial case: direct connection
         Eigen::Matrix2cd S = Eigen::Matrix2cd::Zero();
-        S(0, 1) = 1;
-        S(1, 0) = 1;
+        S(0, 1) = 1.0;
+        S(1, 0) = 1.0;
         return S;
     }
 
-    // Extract couplings
-    VectorXcd m_s = cm.block(1, 0, n, 1);  // Source couplings
-    VectorXcd m_l = cm.block(1, N - 1, n, 1);  // Load couplings
+    const Complex j(0, 1);
+    const Complex lambda = -j * s;
 
-    // Build A diagonal from CM eigenvalues
-    // A(k,k) = cm(k+1, k+1) / j = -j * cm(k+1, k+1)
-    VectorXcd A_diag(n);
-    Complex j(0, 1);
-    for (int k = 0; k < n; ++k) {
-        A_diag(k) = -j * cm(k + 1, k + 1);
-    }
+    MatrixXcd J = MatrixXcd::Zero(N, N);
+    J(0, 0) = j;
+    J(N - 1, N - 1) = j;
 
-    // Compute Y = B^T * (sI - A)^{-1} * B
-    // For diagonal A: Y[i,j] = sum_k B[k,i] * B[k,j] / (s - A[k,k])
-    // B = [m_s, m_l] as columns, so B[k,0] = m_s[k], B[k,1] = m_l[k]
-    Eigen::Matrix2cd Y = Eigen::Matrix2cd::Zero();
-    for (int k = 0; k < n; ++k) {
-        Complex denom = s - A_diag(k);
-        Y(0, 0) += m_s(k) * m_s(k) / denom;
-        Y(0, 1) += m_s(k) * m_l(k) / denom;
-        Y(1, 0) += m_l(k) * m_s(k) / denom;
-        Y(1, 1) += m_l(k) * m_l(k) / denom;
-    }
+    MatrixXcd I_inner = MatrixXcd::Identity(N, N);
+    I_inner(0, 0) = 0.0;
+    I_inner(N - 1, N - 1) = 0.0;
 
-    // S = (I - Y) * (I + Y)^{-1}  (inverse Cayley transform)
-    Eigen::Matrix2cd I = Eigen::Matrix2cd::Identity();
-    Eigen::Matrix2cd S = (I - Y) * (I + Y).inverse();
+    MatrixXcd W = cm - J + lambda * I_inner;
+    MatrixXcd W_inv = W.inverse();
 
+    const Complex s11_internal = Complex(1) + Complex(2) * j * W_inv(0, 0);
+    const Complex s12_internal = -Complex(2) * j * W_inv(0, N - 1);
+    const Complex s21_internal = -Complex(2) * j * W_inv(N - 1, 0);
+    const Complex s22_internal = Complex(1) + Complex(2) * j * W_inv(N - 1, N - 1);
+
+    // Match the physical port ordering used in the original impedance-matching
+    // benchmark: source-side S11 sits at (0,0), even though the internal CM
+    // realization orders the ports oppositely.
+    Eigen::Matrix2cd S;
+    S(0, 0) = -s22_internal;
+    S(0, 1) = -s21_internal;
+    S(1, 0) = -s12_internal;
+    S(1, 1) = -s11_internal;
     return S;
 }
 

@@ -5,6 +5,11 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+# MinGW needs big-obj for template-heavy Eigen code
+if(MINGW)
+    add_compile_options(-Wa,-mbig-obj)
+endif()
+
 # Dependencies - use local Eigen copy
 set(EIGEN_DIR ${CMAKE_CURRENT_SOURCE_DIR}/external/eigen)
 if(EXISTS ${EIGEN_DIR})
@@ -41,6 +46,21 @@ target_link_libraries(matching_example PRIVATE nevanlinna_pick)
 
 add_executable(test_imp_matching examples/test_imp_matching.cpp)
 target_link_libraries(test_imp_matching PRIVATE nevanlinna_pick)
+
+add_executable(realization_check examples/realization_check.cpp)
+target_link_libraries(realization_check PRIVATE nevanlinna_pick)
+
+add_executable(optimization_check examples/optimization_check.cpp)
+target_link_libraries(optimization_check PRIVATE nevanlinna_pick)
+
+add_executable(sparameter_matching examples/sparameter_matching.cpp)
+target_link_libraries(sparameter_matching PRIVATE nevanlinna_pick)
+
+add_executable(first_example_benchmark examples/first_example_benchmark.cpp)
+target_link_libraries(first_example_benchmark PRIVATE nevanlinna_pick)
+
+add_executable(diagnostic examples/diagnostic.cpp)
+target_link_libraries(diagnostic PRIVATE nevanlinna_pick)
 
 # Tests (optional)
 option(BUILD_TESTS "Build unit tests" ON)

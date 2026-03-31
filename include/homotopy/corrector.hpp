@@ -48,19 +48,9 @@ public:
             // Compute Jacobian and solve for correction
             MatrixXcd J = homotopy_->calc_jacobian(x, t);
 
-            // Use SVD for robustness
-            Eigen::JacobiSVD<MatrixXcd> svd(J, Eigen::ComputeThinU | Eigen::ComputeThinV);
-
-            // Check condition number
-            double cond = svd.singularValues()(0) /
-                         svd.singularValues()(svd.singularValues().size() - 1);
-            if (cond > 1e20) {
-                throw SingularMatrixError("Jacobian nearly singular, condition number: " +
-                                         std::to_string(cond));
-            }
-
             // Newton step: x_new = x - J^{-1} * r
-            VectorXcd delta = svd.solve(-r);
+            auto qr = J.colPivHouseholderQr();
+            VectorXcd delta = qr.solve(-r);
             x = x + delta;
 
             // Check for stagnation

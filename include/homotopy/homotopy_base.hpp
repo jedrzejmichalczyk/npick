@@ -17,7 +17,7 @@ namespace np {
  */
 class HomotopyBase {
 public:
-    virtual ~HomotopyBase() = default;
+    virtual ~HomotopyBase();
 
     /**
      * Evaluate the homotopy function H(x, t).
