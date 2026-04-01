@@ -4,6 +4,54 @@ let Module = null;
 let solver = null;
 let loadData = null;
 
+// Default S1P data: patch antenna with resonance at 2.45 GHz
+const DEFAULT_S1P = `! Demo: patch antenna with resonance at 2.45 GHz
+! Mismatched outside the resonance band - good candidate for matching
+# GHz S RI R 50
+1.000  -0.850   0.200
+1.100  -0.830   0.250
+1.200  -0.800   0.300
+1.300  -0.760   0.350
+1.400  -0.710   0.390
+1.500  -0.650   0.420
+1.600  -0.580   0.440
+1.700  -0.500   0.450
+1.800  -0.410   0.440
+1.900  -0.320   0.410
+2.000  -0.230   0.360
+2.050  -0.185   0.330
+2.100  -0.140   0.290
+2.150  -0.100   0.245
+2.200  -0.065   0.195
+2.250  -0.038   0.140
+2.300  -0.020   0.085
+2.350  -0.012   0.030
+2.400  -0.010  -0.025
+2.420  -0.012  -0.048
+2.440  -0.018  -0.070
+2.450  -0.022  -0.080
+2.460  -0.028  -0.090
+2.480  -0.040  -0.108
+2.500  -0.055  -0.125
+2.550  -0.095  -0.170
+2.600  -0.145  -0.220
+2.650  -0.200  -0.270
+2.700  -0.260  -0.320
+2.800  -0.380  -0.400
+2.900  -0.490  -0.440
+3.000  -0.580  -0.450
+3.100  -0.650  -0.430
+3.200  -0.710  -0.400
+3.300  -0.750  -0.360
+3.400  -0.785  -0.320
+3.500  -0.810  -0.280
+3.600  -0.830  -0.240
+3.700  -0.845  -0.200
+3.800  -0.855  -0.165
+3.900  -0.862  -0.135
+4.000  -0.868  -0.108
+`;
+
 // ---- DOM elements ----
 const dropZone    = document.getElementById('dropZone');
 const fileInput   = document.getElementById('fileInput');
@@ -28,14 +76,26 @@ async function initWasm() {
     try {
         Module = await createNpickModule();
         solver = new Module.SolverWrapper();
-        statusEl.textContent = 'Ready. Load an S-parameter file to begin.';
         statusEl.className = '';
         updateRunButton();
+        loadDefaultData();
     } catch (e) {
         statusEl.textContent = 'Failed to load WASM module: ' + e.message;
         statusEl.className = 'error';
     }
 }
+
+function loadDefaultData() {
+    currentFilename = 'demo.s1p';
+    currentFileText = DEFAULT_S1P;
+    loadFileData();
+}
+
+const loadDemoLink = document.getElementById('loadDemo');
+loadDemoLink.addEventListener('click', (e) => {
+    e.preventDefault();
+    loadDefaultData();
+});
 
 initWasm();
 
