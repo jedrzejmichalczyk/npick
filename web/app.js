@@ -2,10 +2,10 @@ import { parseFile } from './touchstone.js';
 
 let Module = null;
 let solver = null;
-let loadData = null;  // { freqs, re, im, freqUnit, numPorts }
+let loadData = null;
 
 // ---- DOM elements ----
-const dropZone   = document.getElementById('dropZone');
+const dropZone    = document.getElementById('dropZone');
 const fileInput   = document.getElementById('fileInput');
 const fileInfo    = document.getElementById('fileInfo');
 const paramGroup  = document.getElementById('paramSelectGroup');
@@ -16,7 +16,7 @@ const orderEl     = document.getElementById('order');
 const rlEl        = document.getElementById('returnLoss');
 const tzEl        = document.getElementById('tzInput');
 const runBtn      = document.getElementById('runBtn');
-const status      = document.getElementById('status');
+const statusEl    = document.getElementById('status');
 const resultsPanel = document.getElementById('resultsPanel');
 const resultBadge  = document.getElementById('resultBadge');
 const resultDetails = document.getElementById('resultDetails');
@@ -27,12 +27,12 @@ async function initWasm() {
     try {
         Module = await createNpickModule();
         solver = new Module.SolverWrapper();
-        status.textContent = 'Ready. Load an S-parameter file to begin.';
-        status.className = '';
+        statusEl.textContent = 'Ready. Load an S-parameter file to begin.';
+        statusEl.className = '';
         updateRunButton();
     } catch (e) {
-        status.textContent = 'Failed to load WASM module: ' + e.message;
-        status.className = 'error';
+        statusEl.textContent = 'Failed to load WASM module: ' + e.message;
+        statusEl.className = 'error';
     }
 }
 
@@ -72,17 +72,15 @@ function loadFileData(portParam) {
     loadData = parseFile(currentFileText, currentFilename, portParam);
 
     if (loadData.freqs.length < 3) {
-        status.textContent = 'Error: file has fewer than 3 data points.';
-        status.className = 'error';
+        statusEl.textContent = 'Error: file has fewer than 3 data points.';
+        statusEl.className = 'error';
         return;
     }
 
-    // Show file info
     fileInfo.textContent = `${currentFilename}: ${loadData.freqs.length} points, ` +
         `${fmtFreq(loadData.freqs[0])} - ${fmtFreq(loadData.freqs[loadData.freqs.length - 1])}`;
     fileInfo.classList.add('visible');
 
-    // Show S-parameter selector for 2-port files
     if (loadData.numPorts >= 2) {
         paramGroup.style.display = '';
     } else {
@@ -96,15 +94,14 @@ function loadFileData(portParam) {
     freqLeftEl.value = +(fMin + 0.2 * fSpan).toPrecision(6);
     freqRightEl.value = +(fMax - 0.2 * fSpan).toPrecision(6);
 
-    // Send to solver
     if (solver) {
         solver.set_load_data(loadData.freqs, loadData.re, loadData.im);
     }
 
     updateRunButton();
     plotLoad();
-    status.textContent = 'Load data imported. Adjust band and click Run.';
-    status.className = '';
+    statusEl.textContent = 'Load data imported. Adjust band and click Run.';
+    statusEl.className = '';
 }
 
 paramSelect.addEventListener('change', () => {
@@ -145,18 +142,8 @@ function plotLoad() {
     }, { responsive: true });
 }
 
-function plotResults(response) {
+function plotResults(resp) {
     if (!loadData) return;
-
-    const freqs = [], load_db = [], g11_db = [], s11_db = [], s21_db = [];
-    for (let i = 0; i < response.length; i++) {
-        const p = response[i];
-        freqs.push(p.freq);
-        load_db.push(p.load_db);
-        g11_db.push(p.g11_db);
-        s11_db.push(p.s11_db);
-        s21_db.push(p.s21_db);
-    }
 
     const fl = parseFloat(freqLeftEl.value);
     const fr = parseFloat(freqRightEl.value);
@@ -172,17 +159,17 @@ function plotResults(response) {
             line: { color: '#90CAF9', width: 1.5, dash: 'dash' }
         },
         {
-            x: freqs, y: g11_db,
+            x: resp.freq, y: resp.g11_db,
             mode: 'lines', name: '|G11| (matched)',
             line: { color: '#E53935', width: 2.5 }
         },
         {
-            x: freqs, y: s11_db,
+            x: resp.freq, y: resp.s11_db,
             mode: 'lines', name: '|S11| (filter)',
             line: { color: '#43A047', width: 1.5 }
         },
         {
-            x: freqs, y: s21_db,
+            x: resp.freq, y: resp.s21_db,
             mode: 'lines', name: '|S21|',
             line: { color: '#00ACC1', width: 1, dash: 'dot' }
         }
@@ -218,13 +205,13 @@ function runSolver() {
     const rl = parseFloat(rlEl.value);
 
     if (!isFinite(fl) || !isFinite(fr) || fl >= fr) {
-        status.textContent = 'Error: invalid frequency band.';
-        status.className = 'error';
+        statusEl.textContent = 'Error: invalid frequency band.';
+        statusEl.className = 'error';
         return;
     }
     if (order < 2 || order > 12) {
-        status.textContent = 'Error: order must be 2-12.';
-        status.className = 'error';
+        statusEl.textContent = 'Error: order must be 2-12.';
+        statusEl.className = 'error';
         return;
     }
 
@@ -233,86 +220,86 @@ function runSolver() {
     const tzText = tzEl.value.trim();
     if (tzText) {
         for (const tok of tzText.split(',')) {
-            const val = parseFloat(tok.trim());
-            if (isFinite(val)) {
-                tzReArr.push(val);
+            const v = parseFloat(tok.trim());
+            if (isFinite(v)) {
+                tzReArr.push(v);
                 tzImArr.push(0);
             }
         }
         if (tzReArr.length > order) {
-            status.textContent = 'Error: too many transmission zeros for this order.';
-            status.className = 'error';
+            statusEl.textContent = 'Error: too many transmission zeros for this order.';
+            statusEl.className = 'error';
             return;
         }
     }
 
     runBtn.disabled = true;
-    status.textContent = 'Solving...';
-    status.className = 'running';
+    statusEl.textContent = 'Solving...';
+    statusEl.className = 'running';
 
     // Run async to let UI update
     setTimeout(() => {
         try {
-            const result = solver.solve(fl, fr, order, rl, tzReArr, tzImArr);
+            const success = solver.solve(fl, fr, order, rl, tzReArr, tzImArr);
 
             resultsPanel.style.display = '';
 
-            if (result.success) {
-                resultBadge.innerHTML = `<span class="result-badge success">` +
-                    `${result.achieved_rl_db.toFixed(1)} dB</span>`;
-
-                const interpFreqs = [];
-                for (let i = 0; i < result.interp_freqs.size(); i++) {
-                    interpFreqs.push(result.interp_freqs.get(i));
-                }
+            if (success) {
+                const rlDb = solver.get_achieved_rl_db();
+                resultBadge.innerHTML = `<span class="result-badge success">${rlDb.toFixed(1)} dB</span>`;
                 resultDetails.innerHTML =
                     `<div style="font-size:0.8rem;margin-top:0.5rem">` +
-                    `Order ${order}, ${tzReArr.length || 'no'} TZ` +
-                    `</div>`;
+                    `Order ${order}, ${tzReArr.length || 'no'} TZ</div>`;
 
-                // Show coupling matrix
-                displayCouplingMatrix(result);
+                displayCouplingMatrix();
 
                 // Evaluate and plot response
                 const fSpan = fr - fl;
                 const resp = solver.evaluate_response(fl - 0.5 * fSpan, fr + 0.5 * fSpan, 501);
-                const points = [];
-                for (let i = 0; i < resp.length; i++) points.push(resp[i]);
-                plotResults(points);
 
-                status.textContent = `Done: ${result.achieved_rl_db.toFixed(1)} dB return loss achieved.`;
-                status.className = '';
+                // Convert val arrays to JS arrays
+                const plotData = {
+                    freq: jsArray(resp.freq),
+                    load_db: jsArray(resp.load_db),
+                    g11_db: jsArray(resp.g11_db),
+                    s11_db: jsArray(resp.s11_db),
+                    s21_db: jsArray(resp.s21_db),
+                };
+                plotResults(plotData);
+
+                statusEl.textContent = `Done: ${rlDb.toFixed(1)} dB return loss achieved.`;
+                statusEl.className = '';
             } else {
+                const errMsg = solver.get_error_message();
                 resultBadge.innerHTML = `<span class="result-badge error">Failed</span>`;
-                resultDetails.innerHTML = `<div style="font-size:0.8rem">${result.error_message}</div>`;
+                resultDetails.innerHTML = `<div style="font-size:0.8rem">${errMsg}</div>`;
                 cmDiv.innerHTML = '';
-                status.textContent = 'Solver failed: ' + result.error_message;
-                status.className = 'error';
+                statusEl.textContent = 'Solver failed: ' + errMsg;
+                statusEl.className = 'error';
             }
         } catch (e) {
             resultsPanel.style.display = '';
             resultBadge.innerHTML = `<span class="result-badge error">Error</span>`;
             resultDetails.innerHTML = `<div style="font-size:0.8rem">${e.message || e}</div>`;
             cmDiv.innerHTML = '';
-            status.textContent = 'Error: ' + (e.message || e);
-            status.className = 'error';
+            statusEl.textContent = 'Error: ' + (e.message || e);
+            statusEl.className = 'error';
         }
 
         runBtn.disabled = false;
     }, 50);
 }
 
-function displayCouplingMatrix(result) {
-    const n = result.cm_size;
+function displayCouplingMatrix() {
+    const n = solver.get_cm_size();
     if (n === 0) { cmDiv.innerHTML = ''; return; }
 
     let html = '<table>';
     for (let i = 0; i < n; i++) {
         html += '<tr>';
         for (let j = 0; j < n; j++) {
-            const idx = i * n + j;
-            const re = result.cm_real.get(idx);
-            const im = result.cm_imag.get(idx);
+            const re = solver.get_cm_real(i, j);
+            const im = solver.get_cm_imag(i, j);
             const val = Math.abs(im) < 1e-10 ? re.toFixed(4) :
                 `${re.toFixed(3)}${im >= 0 ? '+' : ''}${im.toFixed(3)}j`;
             html += `<td>${val}</td>`;
@@ -323,6 +310,14 @@ function displayCouplingMatrix(result) {
     cmDiv.innerHTML = html;
 }
 
+// Convert an emscripten val array to a plain JS array
+function jsArray(v) {
+    const len = v.length;
+    const arr = new Array(len);
+    for (let i = 0; i < len; i++) arr[i] = v[i];
+    return arr;
+}
+
 // ---- Helpers ----
 function fmtFreq(f) {
     if (f >= 1e9) return (f / 1e9).toPrecision(4) + ' GHz';
@@ -331,6 +326,5 @@ function fmtFreq(f) {
     return f.toPrecision(4) + ' Hz';
 }
 
-// Re-plot band shading when band edges change
 freqLeftEl.addEventListener('change', plotLoad);
 freqRightEl.addEventListener('change', plotLoad);

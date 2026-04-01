@@ -2,7 +2,7 @@
  * Emscripten bindings for the Nevanlinna-Pick impedance matching solver.
  *
  * Exposes a SolverWrapper class to JavaScript that accepts S-parameter data
- * as flat arrays, runs the solver, and returns results.
+ * as flat arrays, runs the solver, and returns results via getter methods.
  */
 
 #include <emscripten/bind.h>
@@ -10,7 +10,6 @@
 #include <vector>
 #include <cmath>
 #include <string>
-#include <sstream>
 
 #include "types.hpp"
 #include "impedance_matching.hpp"
@@ -34,7 +33,6 @@ public:
         if (freq <= freqs_.front()) return Complex(re_.front(), im_.front());
         if (freq >= freqs_.back()) return Complex(re_.back(), im_.back());
 
-        // Binary search for interval
         auto it = std::lower_bound(freqs_.begin(), freqs_.end(), freq);
         int idx = static_cast<int>(it - freqs_.begin());
         if (idx == 0) idx = 1;
@@ -51,184 +49,214 @@ private:
     std::vector<double> freqs_, re_, im_;
 };
 
+double to_db(double mag) {
+    if (!std::isfinite(mag) || mag < 1e-15) return -300.0;
+    return 20.0 * std::log10(mag);
+}
+
+std::vector<double> vecFromJS(val v) {
+    std::vector<double> result;
+    int len = v["length"].as<int>();
+    result.reserve(len);
+    for (int i = 0; i < len; ++i) {
+        result.push_back(v[i].as<double>());
+    }
+    return result;
+}
+
 } // namespace
-
-struct SolverResult {
-    bool success;
-    double achieved_rl_db;
-    std::string error_message;
-
-    // Coupling matrix as flat row-major array + dimension
-    std::vector<double> cm_real;
-    std::vector<double> cm_imag;
-    int cm_size;
-
-    // Optimized interpolation frequencies
-    std::vector<double> interp_freqs;
-};
-
-struct ResponsePoint {
-    double freq;
-    double load_db;
-    double g11_db;
-    double s11_db;
-    double s21_db;
-};
 
 class SolverWrapper {
 public:
     SolverWrapper() = default;
 
-    // Set load data from S-parameter samples
     void set_load_data(val js_freqs, val js_re, val js_im) {
         freqs_ = vecFromJS(js_freqs);
         re_ = vecFromJS(js_re);
         im_ = vecFromJS(js_im);
     }
 
-    // Run the solver
-    SolverResult solve(double freq_left, double freq_right, int order,
-                       double return_loss_db, val js_tz_re, val js_tz_im) {
-        SolverResult result;
-        result.success = false;
-        result.cm_size = 0;
+    // Run the solver. Returns true on success.
+    // Frequencies are normalized internally to avoid numerical overflow.
+    bool solve(double freq_left, double freq_right, int order,
+               double return_loss_db, val js_tz_re, val js_tz_im) {
+        success_ = false;
+        error_message_ = "";
+        achieved_rl_db_ = 0;
+        cm_ = MatrixXcd();
+        cm_size_ = 0;
 
         if (freqs_.empty()) {
-            result.error_message = "No load data set";
-            return result;
+            error_message_ = "No load data set";
+            return false;
         }
 
-        // Build transmission zeros
+        // Normalize frequencies: shift to center, scale to [-1, 1]
+        freq_center_ = (freq_left + freq_right) / 2.0;
+        freq_scale_ = (freq_right - freq_left) / 2.0;
+
+        if (freq_scale_ <= 0) {
+            error_message_ = "Invalid frequency band";
+            return false;
+        }
+
+        double norm_left = -1.0;
+        double norm_right = 1.0;
+
+        // Normalize sample frequencies for interpolation
+        std::vector<double> norm_freqs(freqs_.size());
+        for (size_t i = 0; i < freqs_.size(); ++i) {
+            norm_freqs[i] = (freqs_[i] - freq_center_) / freq_scale_;
+        }
+
+        // Build transmission zeros (normalized)
         std::vector<double> tz_re = vecFromJS(js_tz_re);
         std::vector<double> tz_im = vecFromJS(js_tz_im);
         std::vector<Complex> tzs;
         for (size_t i = 0; i < tz_re.size(); ++i) {
-            tzs.push_back(Complex(tz_re[i], tz_im[i]));
+            double norm_tz = (tz_re[i] - freq_center_) / freq_scale_;
+            tzs.push_back(Complex(norm_tz, tz_im[i] / freq_scale_));
         }
 
-        // Create interpolated load function
-        auto load_data = std::make_shared<InterpolatedLoad>(freqs_, re_, im_);
-        auto load_fn = [load_data](double freq) -> Complex {
+        // Create interpolated load using normalized frequencies
+        load_data_ = std::make_shared<InterpolatedLoad>(norm_freqs, re_, im_);
+        auto load_data = load_data_;
+        load_fn_ = [load_data](double freq) -> Complex {
             return (*load_data)(freq);
         };
 
         try {
-            ImpedanceMatching matcher(load_fn, order, tzs, return_loss_db,
-                                      freq_left, freq_right);
+            ImpedanceMatching matcher(load_fn_, order, tzs, return_loss_db,
+                                      norm_left, norm_right);
             matcher.verbose = false;
-            matcher.optimizer_max_iterations = 0;  // equiripple only
+            matcher.optimizer_max_iterations = 0;
 
             MatrixXcd cm = matcher.run();
 
             if (cm.size() == 0) {
-                result.error_message = "Solver failed to produce a coupling matrix";
-                return result;
+                error_message_ = "Solver failed to produce a coupling matrix";
+                return false;
             }
 
-            result.success = true;
-            result.achieved_rl_db = matcher.achieved_return_loss_db();
-            result.interp_freqs.assign(
+            success_ = true;
+            achieved_rl_db_ = matcher.achieved_return_loss_db();
+            cm_ = cm;
+            cm_size_ = cm.rows();
+
+            interp_freqs_.assign(
                 matcher.interpolation_freqs().begin(),
                 matcher.interpolation_freqs().end());
 
-            // Store coupling matrix
-            int n = cm.rows();
-            result.cm_size = n;
-            result.cm_real.resize(n * n);
-            result.cm_imag.resize(n * n);
-            for (int i = 0; i < n; ++i) {
-                for (int j = 0; j < n; ++j) {
-                    result.cm_real[i * n + j] = cm(i, j).real();
-                    result.cm_imag[i * n + j] = cm(i, j).imag();
-                }
-            }
-
-            // Store for response evaluation
-            cm_ = cm;
-            load_fn_ = load_fn;
+            return true;
 
         } catch (const std::exception& e) {
-            result.error_message = e.what();
+            error_message_ = e.what();
+            return false;
+        } catch (...) {
+            error_message_ = "Unknown solver error";
+            return false;
         }
-
-        return result;
     }
 
-    // Evaluate frequency response at N equally-spaced points
+    // --- Getters for results (called from JS after solve) ---
+
+    bool get_success() const { return success_; }
+    double get_achieved_rl_db() const { return achieved_rl_db_; }
+    std::string get_error_message() const { return error_message_; }
+    int get_cm_size() const { return cm_size_; }
+
+    // Get coupling matrix element (i, j) real part
+    double get_cm_real(int i, int j) const {
+        if (i < 0 || i >= cm_size_ || j < 0 || j >= cm_size_) return 0;
+        return cm_(i, j).real();
+    }
+
+    // Get coupling matrix element (i, j) imaginary part
+    double get_cm_imag(int i, int j) const {
+        if (i < 0 || i >= cm_size_ || j < 0 || j >= cm_size_) return 0;
+        return cm_(i, j).imag();
+    }
+
+    // Evaluate frequency response, returns flat JS arrays via val.
+    // freq_left/freq_right are in original (un-normalized) units.
     val evaluate_response(double freq_left, double freq_right, int num_points) {
-        val points = val::array();
+        val result = val::object();
+
+        val js_freq = val::array();
+        val js_load = val::array();
+        val js_g11 = val::array();
+        val js_s11 = val::array();
+        val js_s21 = val::array();
 
         if (cm_.size() == 0 || !load_fn_) {
-            return points;
+            result.set("freq", js_freq);
+            result.set("load_db", js_load);
+            result.set("g11_db", js_g11);
+            result.set("s11_db", js_s11);
+            result.set("s21_db", js_s21);
+            return result;
         }
 
         for (int i = 0; i < num_points; ++i) {
-            double freq = freq_left + (freq_right - freq_left) * i /
-                          static_cast<double>(num_points - 1);
+            // Original frequency for display and load evaluation
+            double freq_orig = freq_left + (freq_right - freq_left) * i /
+                               static_cast<double>(num_points - 1);
 
-            Complex L = load_fn_(freq);
-            Complex s(0, freq);
+            // Normalized frequency for coupling matrix evaluation
+            double freq_norm = (freq_orig - freq_center_) / freq_scale_;
+
+            Complex L = load_fn_(freq_norm);
+            Complex s(0, freq_norm);
             auto S = CouplingMatrix::eval_S(cm_, s);
-            Complex S11 = S(0, 0);
-            Complex S12 = S(0, 1);
-            Complex S21 = S(1, 0);
-            Complex S22 = S(1, 1);
 
-            Complex denom = Complex(1) - S22 * L;
+            Complex denom = Complex(1) - S(1, 1) * L;
             Complex G11 = (std::abs(denom) > 1e-15)
-                ? S11 + S12 * S21 * L / denom
+                ? S(0, 0) + S(0, 1) * S(1, 0) * L / denom
                 : Complex(1e10);
 
-            val pt = val::object();
-            pt.set("freq", freq);
-            pt.set("load_db", to_db(std::abs(L)));
-            pt.set("g11_db", to_db(std::abs(G11)));
-            pt.set("s11_db", to_db(std::abs(S11)));
-            pt.set("s21_db", to_db(std::abs(S21)));
-            points.call<void>("push", pt);
+            js_freq.call<void>("push", freq_orig);
+            js_load.call<void>("push", to_db(std::abs(L)));
+            js_g11.call<void>("push", to_db(std::abs(G11)));
+            js_s11.call<void>("push", to_db(std::abs(S(0, 0))));
+            js_s21.call<void>("push", to_db(std::abs(S(1, 0))));
         }
 
-        return points;
-    }
-
-private:
-    static double to_db(double mag) {
-        if (!std::isfinite(mag) || mag < 1e-15) return -300.0;
-        return 20.0 * std::log10(mag);
-    }
-
-    static std::vector<double> vecFromJS(val v) {
-        std::vector<double> result;
-        int len = v["length"].as<int>();
-        result.reserve(len);
-        for (int i = 0; i < len; ++i) {
-            result.push_back(v[i].as<double>());
-        }
+        result.set("freq", js_freq);
+        result.set("load_db", js_load);
+        result.set("g11_db", js_g11);
+        result.set("s11_db", js_s11);
+        result.set("s21_db", js_s21);
         return result;
     }
 
+private:
     std::vector<double> freqs_, re_, im_;
+    std::shared_ptr<InterpolatedLoad> load_data_;
     MatrixXcd cm_;
     std::function<Complex(double)> load_fn_;
+
+    // Frequency normalization: norm = (orig - center) / scale
+    double freq_center_ = 0;
+    double freq_scale_ = 1;
+
+    bool success_ = false;
+    double achieved_rl_db_ = 0;
+    std::string error_message_;
+    int cm_size_ = 0;
+    std::vector<double> interp_freqs_;
 };
 
 EMSCRIPTEN_BINDINGS(npick) {
-    value_object<SolverResult>("SolverResult")
-        .field("success", &SolverResult::success)
-        .field("achieved_rl_db", &SolverResult::achieved_rl_db)
-        .field("error_message", &SolverResult::error_message)
-        .field("cm_real", &SolverResult::cm_real)
-        .field("cm_imag", &SolverResult::cm_imag)
-        .field("cm_size", &SolverResult::cm_size)
-        .field("interp_freqs", &SolverResult::interp_freqs)
-        ;
-
-    register_vector<double>("VectorDouble");
-
     class_<SolverWrapper>("SolverWrapper")
         .constructor<>()
         .function("set_load_data", &SolverWrapper::set_load_data)
         .function("solve", &SolverWrapper::solve)
+        .function("get_success", &SolverWrapper::get_success)
+        .function("get_achieved_rl_db", &SolverWrapper::get_achieved_rl_db)
+        .function("get_error_message", &SolverWrapper::get_error_message)
+        .function("get_cm_size", &SolverWrapper::get_cm_size)
+        .function("get_cm_real", &SolverWrapper::get_cm_real)
+        .function("get_cm_imag", &SolverWrapper::get_cm_imag)
         .function("evaluate_response", &SolverWrapper::evaluate_response)
         ;
 }

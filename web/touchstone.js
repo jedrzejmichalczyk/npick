@@ -36,6 +36,10 @@ export function parseTouchstone(text, portParam = 'S11') {
                     case 'DB':  format = 'DB'; break;
                 }
             }
+            // Don't convert to Hz - keep the file's native unit.
+            // The solver works in normalized frequency, so physical units don't matter.
+            // This keeps numbers manageable (e.g. 2.45 GHz instead of 2450000000).
+            freqMultiplier = 1;
             continue;
         }
 

@@ -35,11 +35,14 @@ target_link_libraries(npick PRIVATE Eigen3::Eigen)
 set_target_properties(npick PROPERTIES
     SUFFIX ".js"
 )
+target_compile_options(npick PRIVATE -fexceptions)
 target_link_options(npick PRIVATE
     "SHELL:-s MODULARIZE=1"
     "SHELL:-s EXPORT_NAME=createNpickModule"
     "SHELL:-s ALLOW_MEMORY_GROWTH=1"
     "SHELL:-s ENVIRONMENT=web,node"
+    "SHELL:-s ASSERTIONS=1"
+    "SHELL:-s DISABLE_EXCEPTION_CATCHING=0"
     "SHELL:--bind"
-    "SHELL:-O3"
+    "SHELL:-O2"
 )
