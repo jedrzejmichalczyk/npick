@@ -23,6 +23,16 @@ compile_commands.json
 *.png
 *.gp
 
+# CMake build directories
+cmake-build-*/
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Claude Code
+.claude/
+
 # OS files
 .DS_Store
 Thumbs.db
