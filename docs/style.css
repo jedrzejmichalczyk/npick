@@ -16,7 +16,23 @@ header {
     gap: 1rem;
 }
 header h1 { font-size: 1.3rem; font-weight: 600; }
-header span { font-size: 0.85rem; opacity: 0.6; }
+header span { font-size: 0.85rem; opacity: 0.6; flex: 1; }
+header .gh-link {
+    color: rgba(255,255,255,0.6);
+    transition: color 0.15s;
+    display: flex;
+    align-items: center;
+}
+header .gh-link:hover { color: #fff; }
+
+footer {
+    text-align: center;
+    padding: 1rem;
+    font-size: 0.78rem;
+    color: #888;
+}
+footer a { color: #4361ee; text-decoration: none; }
+footer a:hover { text-decoration: underline; }
 
 .container {
     max-width: 1600px;
