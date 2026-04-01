@@ -94,6 +94,13 @@ takes the complementary homotopy continuation approach, which is faster but
 provides a local (rather than globally certified) optimum. In practice both
 methods converge to the same equiripple solution for well-behaved loads.
 
+## Web Interface
+
+A browser-based interface is available in [`web/`](web/). Upload a Touchstone
+(`.s1p`, `.s2p`) or CSV file, select a passband, and run the solver entirely
+client-side via WebAssembly. See [`web/README.md`](web/README.md) for build
+instructions.
+
 ## License
 
 [MIT](LICENSE)

@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>npick - Impedance Matching Solver</title>
+    <link rel="stylesheet" href="style.css">
+    <script src="https://cdn.plot.ly/plotly-2.35.0.min.js" charset="utf-8"></script>
+</head>
+<body>
+
+<header>
+    <h1>npick</h1>
+    <span>Broadband impedance matching via Nevanlinna-Pick interpolation</span>
+</header>
+
+<div class="container">
+    <!-- Left panel: controls -->
+    <div>
+        <div class="panel">
+            <h2>Load Data</h2>
+
+            <div class="drop-zone" id="dropZone">
+                <p>Drop S-parameter file here or click to browse</p>
+                <div class="formats">.s1p .s2p .csv</div>
+                <input type="file" id="fileInput" accept=".s1p,.s2p,.csv,.txt">
+            </div>
+
+            <div class="file-info" id="fileInfo"></div>
+
+            <div class="form-group" id="paramSelectGroup" style="display:none">
+                <label>S-parameter</label>
+                <select id="paramSelect">
+                    <option value="S11">S11</option>
+                    <option value="S22">S22</option>
+                    <option value="S21">S21</option>
+                    <option value="S12">S12</option>
+                </select>
+            </div>
+        </div>
+
+        <div class="panel">
+            <h2>Matching Parameters</h2>
+
+            <div class="form-row">
+                <div class="form-group">
+                    <label>Band start</label>
+                    <input type="number" id="freqLeft" step="any" value="">
+                </div>
+                <div class="form-group">
+                    <label>Band stop</label>
+                    <input type="number" id="freqRight" step="any" value="">
+                </div>
+            </div>
+
+            <div class="form-row">
+                <div class="form-group">
+                    <label>Filter order</label>
+                    <input type="number" id="order" min="2" max="12" value="6">
+                </div>
+                <div class="form-group">
+                    <label>Return loss (dB)</label>
+                    <input type="number" id="returnLoss" min="1" max="40" step="0.5" value="16">
+                </div>
+            </div>
+
+            <div class="form-group">
+                <label>Transmission zeros (comma-separated, optional)</label>
+                <input type="text" id="tzInput" placeholder="e.g. 2.5, 3.0">
+            </div>
+
+            <button class="btn btn-primary" id="runBtn" disabled>Run Solver</button>
+            <div id="status">Loading WASM module...</div>
+        </div>
+
+        <div class="panel" id="resultsPanel" style="display:none">
+            <h2>Results</h2>
+            <div id="resultBadge"></div>
+            <div id="resultDetails"></div>
+            <div class="cm-table" id="couplingMatrix"></div>
+        </div>
+    </div>
+
+    <!-- Right panel: plot -->
+    <div>
+        <div class="panel">
+            <h2>Frequency Response</h2>
+            <div class="plot-area" id="plot"></div>
+        </div>
+    </div>
+</div>
+
+<script src="npick.js"></script>
+<script type="module" src="app.js"></script>
+</body>
+</html>
