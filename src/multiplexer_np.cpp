@@ -627,11 +627,12 @@ std::vector<MatrixXcd> MultiplexerNevanlinnaPick::extract_coupling_matrices(
         auto r_poly = build_polynomial(ch.r_coeffs);
         auto p_poly = build_polynomial(all_p[i]);
 
-        auto r_shifted = r_poly.shift(-ch.freq_center / ch.freq_scale);
-        auto p_shifted = p_poly.shift(-ch.freq_center / ch.freq_scale);
-        auto e_poly = SpectralFactor::feldtkeller(p_shifted, r_shifted);
+        // Polynomials are already in the [-1,1] normalized domain.
+        // No additional shift needed (unlike the single-channel NP solver which
+        // internally shifts by the mean frequency).
+        auto e_poly = SpectralFactor::feldtkeller(p_poly, r_poly);
 
-        cms[i] = CouplingMatrix::from_polynomials_by_realization(p_shifted, r_shifted, e_poly);
+        cms[i] = CouplingMatrix::from_polynomials_by_realization(p_poly, r_poly, e_poly);
     }
 
     return cms;
