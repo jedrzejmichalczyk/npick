@@ -358,43 +358,158 @@ VectorXcd MultiplexerNevanlinnaPick::compute_residual(
 MatrixXcd MultiplexerNevanlinnaPick::compute_jacobian_dp(
     const VectorXcd& x, double lambda) const
 {
-    // Analytical diagonal blocks + FD off-diagonal blocks.
-    auto all_p = split_variables(x);
-    MatrixXcd J = MatrixXcd::Zero(total_eqs_, total_vars_);
+    // Analytical Jacobian following the C# implementation:
+    // J = dMatch/dp - lambda * conj(dG/dp)
+    //
+    // Diagonal blocks: dMatch_i/dp_i = d(f(p_i))/dp_i  (Bezout-based gradient)
+    // Off-diagonal: -lambda * conj(dL_i/dp_j)
+    //   where dL_i/dp_j = v^T · S · dF/dp_j · (W·S·F + I) · v
+    //   S = (I - F·W)^{-1}
 
-    // Diagonal blocks: analytical gradient (accurate)
+    auto all_p = split_variables(x);
+    MatrixXcd Jac = MatrixXcd::Zero(total_eqs_, total_vars_);
+
+    // Precompute per-channel gradients: d(f(p_k))/dp_k at ALL frequencies
+    // grads[k] is (total_freq_count x (order_k + 1)) — gradient of p_k/q_k
+    // We need gradients evaluated at OTHER channels' frequencies too.
+    struct ChannelGradInfo {
+        // Per-channel f(p_k) and df/dp_k at each frequency across all channels
+        std::vector<Complex> f_vals;          // f(p_k) at each freq
+        std::vector<VectorXcd> df_dp_vals;    // df/dp_k at each freq (size num_vars_k)
+    };
+
+    // For each channel k, evaluate f(p_k) and df/dp_k at all required frequencies
+    std::vector<ChannelGradInfo> grad_info(num_channels_);
+
+    for (int k = 0; k < num_channels_; ++k) {
+        auto& ch_k = channels_[k];
+        auto r_poly = build_polynomial(ch_k.r_coeffs);
+        auto p_poly = build_polynomial(all_p[k]);
+        auto q_poly = SpectralFactor::feldtkeller(p_poly, r_poly);
+
+        // Collect all unique physical frequencies where we need channel k evaluated
+        // (from all other channels' interpolation frequencies, plus own)
+        // For simplicity, evaluate at each channel i's frequencies
+        for (int i = 0; i < num_channels_; ++i) {
+            auto& ch_i = channels_[i];
+            for (int m = 0; m < ch_i.order; ++m) {
+                double phys_freq = ch_i.interp_freqs[m];
+                double norm_freq_k = (phys_freq - ch_k.freq_center) / ch_k.freq_scale;
+                Complex s(0, norm_freq_k);
+                Complex p_val = p_poly.evaluate(s);
+                Complex q_val = q_poly.evaluate(s);
+                Complex f_val = (std::abs(q_val) > 1e-15) ? p_val / q_val : Complex(0);
+                grad_info[k].f_vals.push_back(f_val);
+            }
+        }
+    }
+
+    // Diagonal blocks: dMatch_i/dp_i
     for (int i = 0; i < num_channels_; ++i) {
         auto& ch_i = channels_[i];
         MatrixXcd full_grad = eval_channel_grad(i, all_p[i]);
-        J.block(ch_i.eq_offset, ch_i.var_offset,
-                ch_i.order, ch_i.num_vars) = full_grad.rightCols(ch_i.num_vars);
+        Jac.block(ch_i.eq_offset, ch_i.var_offset,
+                  ch_i.order, ch_i.num_vars) = full_grad.rightCols(ch_i.num_vars);
     }
 
-    // Off-diagonal blocks: FD on the full residual (includes coupling)
+    // Off-diagonal blocks: analytical dG/dp
     if (std::abs(lambda) > 1e-15) {
-        VectorXcd F0 = compute_residual(x, lambda);
-        double fd_delta = 1e-6;
+        for (int i = 0; i < num_channels_; ++i) {
+            auto& ch_i = channels_[i];
 
-        for (int j = 0; j < num_channels_; ++j) {
-            auto& ch_j = channels_[j];
-            for (int v = 0; v < ch_j.num_vars; ++v) {
-                VectorXcd x_pert = x;
-                x_pert(ch_j.var_offset + v) += fd_delta;
-                VectorXcd F_pert = compute_residual(x_pert, lambda);
-                VectorXcd dF = (F_pert - F0) / fd_delta;
+            for (int m = 0; m < ch_i.order; ++m) {
+                double phys_freq = ch_i.interp_freqs[m];
+                auto J_mfold = manifold_->compute_J(phys_freq);
+                VectorXcd vi = manifold_->compute_Vi(J_mfold, i);
+                MatrixXcd wi = manifold_->compute_Wi(J_mfold, i);
 
-                // Only write off-diagonal blocks (diagonal already filled analytically)
-                for (int i = 0; i < num_channels_; ++i) {
-                    if (i == j) continue;
-                    auto& ch_i = channels_[i];
-                    J.block(ch_i.eq_offset, ch_j.var_offset + v,
-                            ch_i.order, 1) = dF.segment(ch_i.eq_offset, ch_i.order);
+                int dim = num_channels_ - 1;
+                MatrixXcd Fi = MatrixXcd::Zero(dim, dim);
+
+                // Build F_i diagonal matrix
+                int col = 0;
+                for (int k = 0; k < num_channels_; ++k) {
+                    if (k == i) continue;
+                    double norm_freq_k = (phys_freq - channels_[k].freq_center) / channels_[k].freq_scale;
+                    auto r_poly = build_polynomial(channels_[k].r_coeffs);
+                    auto p_poly = build_polynomial(all_p[k]);
+                    auto q_poly = SpectralFactor::feldtkeller(p_poly, r_poly);
+                    Complex s(0, norm_freq_k);
+                    Complex q_val = q_poly.evaluate(s);
+                    Fi(col, col) = (std::abs(q_val) > 1e-15)
+                        ? p_poly.evaluate(s) / q_val : Complex(0);
+                    col++;
+                }
+
+                // S = (I - F·W)^{-1}
+                MatrixXcd I_dim = MatrixXcd::Identity(dim, dim);
+                MatrixXcd S = (I_dim - Fi * wi).inverse();
+
+                // For each channel j != i, compute dL_i/dp_j
+                for (int j = 0; j < num_channels_; ++j) {
+                    if (j == i) continue;
+                    auto& ch_j = channels_[j];
+
+                    // Index of channel j within the F_i matrix (excluding channel i)
+                    int j_in_Fi = 0;
+                    for (int kk = 0; kk < j; ++kk) {
+                        if (kk != i) j_in_Fi++;
+                    }
+
+                    // Compute per-channel gradient df_j/dp_j at this frequency
+                    double norm_freq_j = (phys_freq - ch_j.freq_center) / ch_j.freq_scale;
+
+                    // We need df_j/dp_j_coeff for each free coefficient of channel j
+                    // eval_channel_grad gives gradient at channel j's own interp freqs,
+                    // but we need it at channel i's frequency. Compute directly.
+                    auto r_poly_j = build_polynomial(ch_j.r_coeffs);
+                    auto p_poly_j = build_polynomial(all_p[j]);
+                    auto q_poly_j = SpectralFactor::feldtkeller(p_poly_j, r_poly_j);
+
+                    Complex s_j(0, norm_freq_j);
+                    Complex p_val_j = p_poly_j.evaluate(s_j);
+                    Complex q_val_j = q_poly_j.evaluate(s_j);
+
+                    int N_j = static_cast<int>(all_p[j].size());
+
+                    for (int v = 0; v < ch_j.num_vars; ++v) {
+                        // df_j/dp_j[v]: derivative of f_j = p_j/q_j w.r.t. the v-th
+                        // free coefficient (v+1 in monic indexing, degree N_j-1-(v+1))
+                        int coeff_idx = v + 1;  // skip leading 1
+                        int deg = N_j - 1 - coeff_idx;
+
+                        // dp/dp_v = s^deg (monomial)
+                        Complex dp_val = std::pow(s_j, deg);
+
+                        // dq/dp_v: solve Bezout for this single perturbation
+                        // For efficiency, use the quotient rule approximation:
+                        // df/dp_v ≈ (dp_val * q - p * dq_val) / q^2
+                        // We need dq_val. Use FD on the spectral factor.
+                        auto p_pert_coeffs = all_p[j];
+                        p_pert_coeffs(coeff_idx) += 1e-7;
+                        auto p_pert_poly = build_polynomial(p_pert_coeffs);
+                        auto q_pert_poly = SpectralFactor::feldtkeller(p_pert_poly, r_poly_j);
+                        Complex dq_val = (q_pert_poly.evaluate(s_j) - q_val_j) / 1e-7;
+
+                        Complex df_j_dpv = (dp_val * q_val_j - p_val_j * dq_val)
+                                         / (q_val_j * q_val_j);
+
+                        // dF/dp_j[v]: diagonal matrix with df_j_dpv at position (j_in_Fi, j_in_Fi)
+                        MatrixXcd dF = MatrixXcd::Zero(dim, dim);
+                        dF(j_in_Fi, j_in_Fi) = df_j_dpv;
+
+                        // dL_i/dp_j[v] = v^T · S · dF · (W·S·F + I) · v
+                        MatrixXcd WSF_I = wi * S * Fi + I_dim;
+                        Complex dL = (vi.adjoint() * S * dF * WSF_I * vi)(0, 0);
+
+                        Jac(ch_i.eq_offset + m, ch_j.var_offset + v) = -lambda * std::conj(dL);
+                    }
                 }
             }
         }
     }
 
-    return J;
+    return Jac;
 }
 
 VectorXcd MultiplexerNevanlinnaPick::compute_dF_dlambda(
