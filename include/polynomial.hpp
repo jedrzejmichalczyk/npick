@@ -65,8 +65,10 @@ public:
     // Para-conjugate: p*(s) = sum of conj(c_k) * (-1)^k * s^k
     Polynomial<T> para_conjugate() const {
         std::vector<T> new_coeffs(coefficients.size());
+        double sign = 1.0;
         for (size_t i = 0; i < coefficients.size(); ++i) {
-            new_coeffs[i] = std::conj(coefficients[i]) * std::pow(-1.0, static_cast<int>(i));
+            new_coeffs[i] = std::conj(coefficients[i]) * sign;
+            sign = -sign;
         }
         return Polynomial<T>(new_coeffs);
     }

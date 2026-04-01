@@ -356,21 +356,28 @@ Eigen::Matrix2cd CouplingMatrix::eval_S(const MatrixXcd& cm, Complex s) {
     const Complex j(0, 1);
     const Complex lambda = -j * s;
 
-    MatrixXcd J = MatrixXcd::Zero(N, N);
-    J(0, 0) = j;
-    J(N - 1, N - 1) = j;
+    MatrixXcd W = cm;
+    W(0, 0) -= j;
+    W(N - 1, N - 1) -= j;
+    for (int i = 1; i < N - 1; ++i)
+        W(i, i) += lambda;
 
-    MatrixXcd I_inner = MatrixXcd::Identity(N, N);
-    I_inner(0, 0) = 0.0;
-    I_inner(N - 1, N - 1) = 0.0;
+    // Solve W * x = e_0 and W * x = e_{N-1} instead of full inverse.
+    // We only need columns 0 and N-1 of W^{-1}.
+    Eigen::PartialPivLU<MatrixXcd> lu(W);
 
-    MatrixXcd W = cm - J + lambda * I_inner;
-    MatrixXcd W_inv = W.inverse();
+    VectorXcd e0 = VectorXcd::Zero(N);
+    VectorXcd eN = VectorXcd::Zero(N);
+    e0(0) = 1.0;
+    eN(N - 1) = 1.0;
 
-    const Complex s11_internal = Complex(1) + Complex(2) * j * W_inv(0, 0);
-    const Complex s12_internal = -Complex(2) * j * W_inv(0, N - 1);
-    const Complex s21_internal = -Complex(2) * j * W_inv(N - 1, 0);
-    const Complex s22_internal = Complex(1) + Complex(2) * j * W_inv(N - 1, N - 1);
+    VectorXcd col0 = lu.solve(e0);
+    VectorXcd colN = lu.solve(eN);
+
+    const Complex s11_internal = Complex(1) + Complex(2) * j * col0(0);
+    const Complex s12_internal = -Complex(2) * j * colN(0);
+    const Complex s21_internal = -Complex(2) * j * col0(N - 1);
+    const Complex s22_internal = Complex(1) + Complex(2) * j * colN(N - 1);
 
     // Match the physical port ordering used in the original impedance-matching
     // benchmark: source-side S11 sits at (0,0), even though the internal CM

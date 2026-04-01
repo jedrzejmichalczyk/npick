@@ -107,6 +107,17 @@ protected:
 
     VectorXcd target_loads_;   // Target interpolation values
     VectorXcd init_sparams_;   // Initial S-parameters at interpolation points
+
+    // Spectral factor cache: avoids recomputing feldtkeller when eval_map
+    // and eval_grad are called with the same p_coeffs (common in corrector).
+    mutable VectorXcd cached_p_coeffs_;
+    mutable Polynomial<Complex> cached_q_poly_;
+    mutable bool cache_valid_ = false;
+
+    Polynomial<Complex> cached_feldtkeller(
+        const Polynomial<Complex>& p_poly,
+        const Polynomial<Complex>& r_poly,
+        const VectorXcd& p_coeffs) const;
 };
 
 /**

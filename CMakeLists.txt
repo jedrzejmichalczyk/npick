@@ -62,6 +62,9 @@ target_link_libraries(first_example_benchmark PRIVATE nevanlinna_pick)
 add_executable(diagnostic examples/diagnostic.cpp)
 target_link_libraries(diagnostic PRIVATE nevanlinna_pick)
 
+add_executable(benchmark_suite examples/benchmark_suite.cpp)
+target_link_libraries(benchmark_suite PRIVATE nevanlinna_pick)
+
 # Tests (optional)
 option(BUILD_TESTS "Build unit tests" ON)
 if(BUILD_TESTS)

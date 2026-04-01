@@ -1,5 +1,4 @@
 #include "nevanlinna_pick.hpp"
-#include <Eigen/SVD>
 #include <cmath>
 #include <algorithm>
 #include <numeric>
@@ -67,12 +66,28 @@ NevanlinnaPick::NevanlinnaPick(
     init_sparams_ = eval_map(initial_p_);
 }
 
+Polynomial<Complex> NevanlinnaPick::cached_feldtkeller(
+    const Polynomial<Complex>& p_poly,
+    const Polynomial<Complex>& r_poly,
+    const VectorXcd& p_coeffs) const
+{
+    if (cache_valid_ && cached_p_coeffs_.size() == p_coeffs.size() &&
+        cached_p_coeffs_ == p_coeffs) {
+        return cached_q_poly_;
+    }
+    auto q = SpectralFactor::feldtkeller(p_poly, r_poly);
+    cached_p_coeffs_ = p_coeffs;
+    cached_q_poly_ = q;
+    cache_valid_ = true;
+    return q;
+}
+
 VectorXcd NevanlinnaPick::eval_map(const VectorXcd& p_coeffs) const {
     auto r_poly = build_polynomial(r_coeffs_);
     auto p_poly = build_polynomial(p_coeffs);
 
     // Compute spectral factor q such that |q|² = |p|² + |r|²
-    auto q_poly = SpectralFactor::feldtkeller(p_poly, r_poly);
+    auto q_poly = cached_feldtkeller(p_poly, r_poly, p_coeffs);
 
     // Evaluate p/q at each interpolation frequency
     VectorXcd result(freqs_.size());
@@ -92,7 +107,7 @@ VectorXcd NevanlinnaPick::eval_map(const VectorXcd& p_coeffs) const {
 MatrixXcd NevanlinnaPick::eval_grad(const VectorXcd& p_coeffs) const {
     auto r_poly = build_polynomial(r_coeffs_);
     auto p_poly = build_polynomial(p_coeffs);
-    auto q_poly = SpectralFactor::feldtkeller(p_poly, r_poly);
+    auto q_poly = cached_feldtkeller(p_poly, r_poly, p_coeffs);
 
     int N = static_cast<int>(p_coeffs.size());
     int M = static_cast<int>(freqs_.size());
@@ -129,15 +144,17 @@ MatrixXcd NevanlinnaPick::eval_grad(const VectorXcd& p_coeffs) const {
         // Real q: dq has n real unknowns
         Eigen::MatrixXd A = Eigen::MatrixXd::Zero(2 * num_eqs, N);
         for (int k = 0; k < num_eqs; ++k) {
+            double sign_i = 1.0;
             for (int i = 0; i < N; ++i) {
                 int j = k - i;
-                if (j < 0 || j > q_deg) continue;
-                Complex q_para_c = q_para.coefficients[j];
-                Complex q_c = q_poly.coefficients[j];
-                double sign_i = std::pow(-1.0, i);
-                Complex coeff = q_para_c + q_c * sign_i;
-                A(2 * k, i) += coeff.real();
-                A(2 * k + 1, i) += coeff.imag();
+                if (j >= 0 && j <= q_deg) {
+                    Complex q_para_c = q_para.coefficients[j];
+                    Complex q_c = q_poly.coefficients[j];
+                    Complex coeff = q_para_c + q_c * sign_i;
+                    A(2 * k, i) += coeff.real();
+                    A(2 * k + 1, i) += coeff.imag();
+                }
+                sign_i = -sign_i;
             }
         }
         auto qr = A.colPivHouseholderQr();
@@ -174,16 +191,18 @@ MatrixXcd NevanlinnaPick::eval_grad(const VectorXcd& p_coeffs) const {
         // Complex q: dq has 2n real unknowns
         Eigen::MatrixXd A = Eigen::MatrixXd::Zero(2 * num_eqs, 2 * N);
         for (int k = 0; k < num_eqs; ++k) {
+            double sign = 1.0;
             for (int i = 0; i < N; ++i) {
                 int j_idx = k - i;
-                if (j_idx < 0 || j_idx > q_deg) continue;
-                Complex qp_j = q_para.coefficients[j_idx];
-                Complex q_j = q_poly.coefficients[j_idx];
-                double sign = std::pow(-1.0, i);
-                A(2*k,   2*i)   += qp_j.real() + sign * q_j.real();
-                A(2*k,   2*i+1) += -qp_j.imag() + sign * q_j.imag();
-                A(2*k+1, 2*i)   += qp_j.imag() + sign * q_j.imag();
-                A(2*k+1, 2*i+1) += qp_j.real() - sign * q_j.real();
+                if (j_idx >= 0 && j_idx <= q_deg) {
+                    Complex qp_j = q_para.coefficients[j_idx];
+                    Complex q_j = q_poly.coefficients[j_idx];
+                    A(2*k,   2*i)   += qp_j.real() + sign * q_j.real();
+                    A(2*k,   2*i+1) += -qp_j.imag() + sign * q_j.imag();
+                    A(2*k+1, 2*i)   += qp_j.imag() + sign * q_j.imag();
+                    A(2*k+1, 2*i+1) += qp_j.real() - sign * q_j.real();
+                }
+                sign = -sign;
             }
         }
         auto qr = A.colPivHouseholderQr();
@@ -270,25 +289,24 @@ Polynomial<Complex> NevanlinnaPick::solve_bezout(
 
     // Fill matrix
     for (int k = 0; k < num_eqs; ++k) {
+        double sign = 1.0;
         for (int i = 0; i < n; ++i) {
             int j = k - i;
-            if (j < 0 || j > q_deg) continue;
+            if (j >= 0 && j <= q_deg) {
+                Complex q_para_j = q_para.coefficients[j];
+                Complex q_j = q.coefficients[j];
 
-            Complex q_para_j = q_para.coefficients[j];
-            Complex q_j = q.coefficients[j];
-            double sign = std::pow(-1.0, i);
-
-            // Coefficient contributions (see C# implementation for derivation)
-            A(2 * k, 2 * i) += q_para_j.real() + sign * q_j.real();
-            A(2 * k, 2 * i + 1) += -q_para_j.imag() + sign * q_j.imag();
-            A(2 * k + 1, 2 * i) += q_para_j.imag() + sign * q_j.imag();
-            A(2 * k + 1, 2 * i + 1) += q_para_j.real() - sign * q_j.real();
+                A(2 * k, 2 * i) += q_para_j.real() + sign * q_j.real();
+                A(2 * k, 2 * i + 1) += -q_para_j.imag() + sign * q_j.imag();
+                A(2 * k + 1, 2 * i) += q_para_j.imag() + sign * q_j.imag();
+                A(2 * k + 1, 2 * i + 1) += q_para_j.real() - sign * q_j.real();
+            }
+            sign = -sign;
         }
     }
 
-    // Solve least squares using SVD
-    Eigen::JacobiSVD<Eigen::MatrixXd> svd(A, Eigen::ComputeThinU | Eigen::ComputeThinV);
-    Eigen::VectorXd solution = svd.solve(b);
+    // Solve least squares
+    Eigen::VectorXd solution = A.colPivHouseholderQr().solve(b);
 
     // Extract coefficients
     std::vector<Complex> dq_coeffs(n);
@@ -336,25 +354,22 @@ Polynomial<Complex> NevanlinnaPick::solve_bezout_real(
 
     // Build matrix (simplified for real dq)
     for (int k = 0; k < num_eqs; ++k) {
+        double sign_i = 1.0;
         for (int i = 0; i < n; ++i) {
             int j = k - i;
-            if (j < 0 || j > q_deg) continue;
-
-            Complex q_para_coeff = q_para.coefficients[j];
-            Complex q_coeff = q.coefficients[j];
-            double sign_i = std::pow(-1.0, i);
-
-            // For real d_i: total coefficient is (q_para[j] + q[j] * (-1)^i)
-            Complex coeff = q_para_coeff + q_coeff * sign_i;
-
-            A(2 * k, i) += coeff.real();
-            A(2 * k + 1, i) += coeff.imag();
+            if (j >= 0 && j <= q_deg) {
+                Complex q_para_coeff = q_para.coefficients[j];
+                Complex q_coeff = q.coefficients[j];
+                Complex coeff = q_para_coeff + q_coeff * sign_i;
+                A(2 * k, i) += coeff.real();
+                A(2 * k + 1, i) += coeff.imag();
+            }
+            sign_i = -sign_i;
         }
     }
 
     // Solve least squares
-    Eigen::JacobiSVD<Eigen::MatrixXd> svd(A, Eigen::ComputeThinU | Eigen::ComputeThinV);
-    Eigen::VectorXd solution = svd.solve(b);
+    Eigen::VectorXd solution = A.colPivHouseholderQr().solve(b);
 
     // Build dq polynomial with real coefficients
     std::vector<Complex> dq_coeffs(n);
