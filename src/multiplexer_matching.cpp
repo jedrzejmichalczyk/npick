@@ -58,7 +58,15 @@ std::vector<MatrixXcd> MultiplexerMatching::run() {
                       << N << " channels\n";
             // Verify start
             VectorXcd H0 = mux_np.calc_homotopy_function(x0, 1.0);
-            std::cout << "  Start residual: " << H0.norm() << "\n";
+            std::cout << "  Start residual: " << H0.norm()
+                      << " (max component: " << H0.lpNorm<Eigen::Infinity>() << ")\n";
+            for (int k = 0; k < std::min(static_cast<int>(H0.size()), 12); ++k) {
+                std::cout << "    H[" << k << "] = " << H0(k) << "\n";
+            }
+            // Debug: verify init_sparams matches eval at start
+            VectorXcd x0_copy = x0;
+            VectorXcd H_at_1 = mux_np.calc_homotopy_function(x0_copy, 1.0);
+            std::cout << "  H(x0,1) should be 0: " << H_at_1.norm() << "\n";
         }
 
         VectorXcd solution = tracker.run(x0);

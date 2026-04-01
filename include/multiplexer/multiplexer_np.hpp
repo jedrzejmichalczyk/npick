@@ -52,14 +52,15 @@ private:
     // Per-channel data
     struct ChannelData {
         int order;
-        int num_vars;     // order - 1 (monic)
+        int num_vars;     // order (monic: order+1 coeffs minus leading 1)
         int var_offset;   // offset into concatenated x
         int eq_offset;    // offset into concatenated H
         std::vector<double> interp_freqs;   // physical frequencies
         std::vector<double> norm_freqs;     // normalized to [-1, 1]
         double freq_center, freq_scale;     // normalization params
         VectorXcd r_coeffs;                 // transmission polynomial (descending)
-        VectorXcd initial_p;                // start solution from independent NP
+        VectorXcd initial_p;                // Chebyshev prototype (monic, reduced)
+        VectorXcd init_sparams;             // f(chebyshev_i) at interp freqs
     };
 
     int num_channels_;

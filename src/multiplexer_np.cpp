@@ -29,7 +29,7 @@ MultiplexerNevanlinnaPick::MultiplexerNevanlinnaPick(
     for (int i = 0; i < num_channels_; ++i) {
         auto& ch = channels_[i];
         ch.order = specs[i].order;
-        ch.num_vars = ch.order - 1;  // monic
+        ch.num_vars = ch.order;  // F has degree order → order+1 coeffs, monic drops 1
         ch.var_offset = total_vars_;
         ch.eq_offset = total_eqs_;
         ch.interp_freqs = interp_freqs[i];
@@ -43,7 +43,7 @@ MultiplexerNevanlinnaPick::MultiplexerNevanlinnaPick(
             ch.norm_freqs[m] = (ch.interp_freqs[m] - ch.freq_center) / ch.freq_scale;
         }
 
-        // Build transmission polynomial from specs
+        // Build Chebyshev filter: both r_coeffs and initial_p from same instance
         std::vector<Complex> shifted_tzs;
         for (const auto& tz : specs[i].transmission_zeros) {
             shifted_tzs.push_back((tz - ch.freq_center) / ch.freq_scale);
@@ -52,58 +52,33 @@ MultiplexerNevanlinnaPick::MultiplexerNevanlinnaPick(
         ChebyshevFilter ref_filter(ch.order, shifted_tzs, specs[i].return_loss_db);
         ch.r_coeffs = get_coeffs(ref_filter.P());
 
+        // Start solution: Chebyshev prototype F polynomial (monic).
+        // F has degree = order, so get_coeffs gives order+1 entries in descending.
+        // The NP solver uses order coefficients (degree order-1 polynomial) for p.
+        // get_coeffs(F()) = [leading, c_{n-1}, ..., c_0] with n+1 entries.
+        // We need [c_{n-1}, ..., c_0] = tail(order) for the full p, then
+        // drop leading for monic: tail(order - 1).
+        // But actually the NP convention: initial_p_ has order_ entries (the full
+        // monic polynomial), and get_start_solution drops the first (leading 1).
+        // So initial_p should have num_vars = order - 1 entries.
+        VectorXcd full_p = get_coeffs(ref_filter.F());
+        // full_p has size order+1: [1, c_{n-1}, ..., c_0] (descending)
+        // Drop leading 1 for monic representation
+        ch.initial_p = full_p.tail(ch.order);  // size = order = num_vars
+
+        // Precompute init_sparams: f(chebyshev_i) at each interpolation frequency
+        VectorXcd monic_p = to_monic(ch.initial_p);
+        ch.init_sparams = eval_channel_map(i, monic_p);
+
+        // Verify round-trip: eval again should give same result
+        VectorXcd check = eval_channel_map(i, monic_p);
+        double diff = (ch.init_sparams - check).norm();
+        if (diff > 1e-12) {
+            std::cerr << "WARNING: ch" << i << " init_sparams round-trip diff=" << diff << "\n";
+        }
+
         total_vars_ += ch.num_vars;
         total_eqs_ += ch.order;
-    }
-
-    // Compute start solutions: independent NP solve per channel
-    for (int i = 0; i < num_channels_; ++i) {
-        auto& ch = channels_[i];
-
-        // Load for independent solve: conj(J_ii) at each interpolation frequency
-        auto load_fn = [this, i](double norm_freq) -> Complex {
-            auto& ch_data = channels_[i];
-            double phys_freq = norm_freq * ch_data.freq_scale + ch_data.freq_center;
-            auto J = manifold_->compute_J(phys_freq);
-            int port = i + 1;
-            return J(port, port);
-        };
-
-        std::vector<Complex> target_loads(ch.order);
-        for (int m = 0; m < ch.order; ++m) {
-            target_loads[m] = load_fn(ch.norm_freqs[m]);
-        }
-
-        // Use the existing NP solver for independent matching
-        try {
-            std::vector<Complex> shifted_tzs;
-            for (const auto& tz : specs[i].transmission_zeros) {
-                shifted_tzs.push_back((tz - ch.freq_center) / ch.freq_scale);
-            }
-
-            NevanlinnaPickNormalized np_single(
-                target_loads, ch.norm_freqs, shifted_tzs, specs[i].return_loss_db);
-
-            PathTracker tracker(&np_single);
-            tracker.h = -0.02;
-            tracker.run_tol = 1e-3;
-            tracker.final_tol = 1e-7;
-            tracker.verbose = false;
-
-            VectorXcd x0 = np_single.get_start_solution();
-            VectorXcd sol = tracker.run(x0);
-            ch.initial_p = sol;  // reduced (monic) coefficients
-
-        } catch (const std::exception& e) {
-            // Fallback: use Chebyshev prototype as start
-            std::vector<Complex> shifted_tzs;
-            for (const auto& tz : specs[i].transmission_zeros) {
-                shifted_tzs.push_back((tz - ch.freq_center) / ch.freq_scale);
-            }
-            ChebyshevFilter cheb(ch.order, shifted_tzs, specs[i].return_loss_db);
-            VectorXcd full = get_coeffs(cheb.F());
-            ch.initial_p = full.tail(full.size() - 1);  // drop leading coeff
-        }
     }
 }
 
@@ -347,20 +322,26 @@ Complex MultiplexerNevanlinnaPick::eval_coupled_load(
 }
 
 VectorXcd MultiplexerNevanlinnaPick::calc_homotopy_function(const VectorXcd& x, double t) {
-    double lambda = 1.0 - t;
+    // H_i(x, t) = t * init_sparams_i + (1-t) * conj(L_i(x)) - f(p_i)(x)
+    //
+    // At t=1: init_sparams_i - f(chebyshev_i) = 0 (trivially satisfied)
+    // At t=0: conj(L_i(x)) - f(p_i) = 0 (Martinez matching with full coupling)
+    //
+    // The coupling lambda is always 1 (full coupling). The homotopy parameter t
+    // blends between the Chebyshev prototype target and the coupled load target.
 
-    auto all_p = split_variables(x);  // monic coefficients per channel
+    auto all_p = split_variables(x);
     VectorXcd H(total_eqs_);
 
     for (int i = 0; i < num_channels_; ++i) {
         auto& ch = channels_[i];
 
-        // f(p_i) at each interpolation frequency
         VectorXcd fi = eval_channel_map(i, all_p[i]);
 
         for (int m = 0; m < ch.order; ++m) {
-            Complex L_i = eval_coupled_load(i, ch.interp_freqs[m], lambda, all_p);
-            H(ch.eq_offset + m) = fi(m) - std::conj(L_i);
+            Complex L_i = eval_coupled_load(i, ch.interp_freqs[m], 1.0, all_p);
+            Complex target = t * ch.init_sparams(m) + (1.0 - t) * std::conj(L_i);
+            H(ch.eq_offset + m) = target - fi(m);
         }
     }
 
@@ -368,13 +349,9 @@ VectorXcd MultiplexerNevanlinnaPick::calc_homotopy_function(const VectorXcd& x, 
 }
 
 VectorXcd MultiplexerNevanlinnaPick::calc_path_derivative(const VectorXcd& x, double t) {
-    // dH/dt = -dH/dlambda since lambda = 1 - t
-    // dH_{i,m}/dlambda = -d(conj(L_i))/dlambda
-    // L_i(lambda) = J_ii + lambda * coupling_term
-    // dL_i/dlambda = coupling_term
-    // dH/dt = -(-conj(coupling_term)) = conj(coupling_term)
+    // H_i = t * init_sparams_i + (1-t) * conj(L_i) - f(p_i)
+    // dH_i/dt = init_sparams_i - conj(L_i)
 
-    double lambda = 1.0 - t;
     auto all_p = split_variables(x);
     VectorXcd dHdt(total_eqs_);
 
@@ -382,14 +359,8 @@ VectorXcd MultiplexerNevanlinnaPick::calc_path_derivative(const VectorXcd& x, do
         auto& ch = channels_[i];
 
         for (int m = 0; m < ch.order; ++m) {
-            // coupling_term = V_i^T [I - F_i W_i]^{-1} F_i V_i
-            Complex L_full = eval_coupled_load(i, ch.interp_freqs[m], 1.0, all_p);
-            auto J = manifold_->compute_J(ch.interp_freqs[m]);
-            Complex J_ii = J(i + 1, i + 1);
-            Complex coupling_term = L_full - J_ii;
-
-            // dH/dt = conj(coupling_term)  (since dH/dt = -d/dlambda[-conj(L)])
-            dHdt(ch.eq_offset + m) = std::conj(coupling_term);
+            Complex L_i = eval_coupled_load(i, ch.interp_freqs[m], 1.0, all_p);
+            dHdt(ch.eq_offset + m) = ch.init_sparams(m) - std::conj(L_i);
         }
     }
 
@@ -397,46 +368,43 @@ VectorXcd MultiplexerNevanlinnaPick::calc_path_derivative(const VectorXcd& x, do
 }
 
 MatrixXcd MultiplexerNevanlinnaPick::calc_jacobian(const VectorXcd& x, double t) {
-    double lambda = 1.0 - t;
-    auto all_p = split_variables(x);
+    // H_i = t * init_sparams_i + (1-t) * conj(L_i(x)) - f(p_i)(x)
+    // dH_i/dp_i = -d(f(p_i))/dp_i + (1-t) * conj(dL_i/dp_i)
+    //           = -eval_channel_grad(i)  (since L_i doesn't depend on p_i)
+    // dH_i/dp_j = (1-t) * conj(dL_i/dp_j)  for j != i
 
+    auto all_p = split_variables(x);
     MatrixXcd J_mat = MatrixXcd::Zero(total_eqs_, total_vars_);
 
     for (int i = 0; i < num_channels_; ++i) {
         auto& ch_i = channels_[i];
 
-        // Diagonal block: dH_i / dp_i = d(f(p_i))/dp_i
-        // (L_i does NOT depend on p_i since F_i excludes channel i)
+        // Diagonal block: -d(f(p_i))/dp_i
         MatrixXcd full_grad = eval_channel_grad(i, all_p[i]);
-        // full_grad is (order_i x order_i), we need (order_i x (order_i - 1))
-        // since p_i is monic, drop first column (derivative w.r.t. leading coeff = 1)
-        MatrixXcd diag_block = full_grad.rightCols(full_grad.cols() - 1);
+        MatrixXcd diag_block = -full_grad.rightCols(full_grad.cols() - 1);
 
         J_mat.block(ch_i.eq_offset, ch_i.var_offset,
                     ch_i.order, ch_i.num_vars) = diag_block;
 
-        // Off-diagonal blocks: dH_i / dp_j = -conj(dL_i/dp_j)
-        if (std::abs(lambda) > 1e-15) {
+        // Off-diagonal blocks via finite differences: (1-t) * conj(dL_i/dp_j)
+        if (std::abs(1.0 - t) > 1e-15) {
             for (int j = 0; j < num_channels_; ++j) {
                 if (j == i) continue;
                 auto& ch_j = channels_[j];
 
-                // Compute dL_i/dp_j via finite differences for now
-                // (analytical version requires chain rule through M^{-1})
                 double fd_delta = 1e-7;
                 for (int v = 0; v < ch_j.num_vars; ++v) {
                     auto all_p_pert = all_p;
-                    // Perturb the v-th free coefficient of channel j
-                    // (index v+1 in monic representation since index 0 is the leading 1)
                     all_p_pert[j](v + 1) += fd_delta;
 
                     for (int m = 0; m < ch_i.order; ++m) {
                         Complex L_pert = eval_coupled_load(
-                            i, ch_i.interp_freqs[m], lambda, all_p_pert);
+                            i, ch_i.interp_freqs[m], 1.0, all_p_pert);
                         Complex L_base = eval_coupled_load(
-                            i, ch_i.interp_freqs[m], lambda, all_p);
+                            i, ch_i.interp_freqs[m], 1.0, all_p);
                         Complex dL = (L_pert - L_base) / fd_delta;
-                        J_mat(ch_i.eq_offset + m, ch_j.var_offset + v) = -std::conj(dL);
+                        J_mat(ch_i.eq_offset + m, ch_j.var_offset + v) =
+                            (1.0 - t) * std::conj(dL);
                     }
                 }
             }
