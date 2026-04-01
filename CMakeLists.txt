@@ -33,6 +33,10 @@ add_library(nevanlinna_pick
     src/path_tracker.cpp
     src/dopr853_predictor.cpp
     src/corrector.cpp
+    src/t_junction.cpp
+    src/manifold.cpp
+    src/multiplexer_np.cpp
+    src/multiplexer_matching.cpp
 )
 target_include_directories(nevanlinna_pick PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -64,6 +68,9 @@ target_link_libraries(diagnostic PRIVATE nevanlinna_pick)
 
 add_executable(benchmark_suite examples/benchmark_suite.cpp)
 target_link_libraries(benchmark_suite PRIVATE nevanlinna_pick)
+
+add_executable(triplexer_example examples/triplexer_example.cpp)
+target_link_libraries(triplexer_example PRIVATE nevanlinna_pick)
 
 # Tests (optional)
 option(BUILD_TESTS "Build unit tests" ON)
