@@ -31,9 +31,23 @@ async function initWasm() {
         statusEl.textContent = 'Ready. Load an S-parameter file to begin.';
         statusEl.className = '';
         updateRunButton();
+        await loadDefaultSample();
     } catch (e) {
         statusEl.textContent = 'Failed to load WASM module: ' + e.message;
         statusEl.className = 'error';
+    }
+}
+
+async function loadDefaultSample() {
+    try {
+        const resp = await fetch('sample_antenna.s1p');
+        if (!resp.ok) return;
+        currentFileText = await resp.text();
+        currentFilename = 'sample_antenna.s1p';
+        loadFileData();
+        statusEl.textContent = 'Sample antenna loaded. Adjust parameters and click Run, or drop your own file.';
+    } catch (_) {
+        // Silently ignore — user can still load their own file
     }
 }
 
