@@ -46,9 +46,30 @@ public:
     double path_tracker_h = -0.02;
     double path_tracker_run_tol = 1e-3;
     double path_tracker_final_tol = 1e-7;
+    int equiripple_outer_iterations = 5;   // round-robin passes over channels
+    int equiripple_inner_iterations = 10;  // Newton iterations per channel
     bool verbose = false;
 
 private:
+    /**
+     * Run per-channel equiripple optimization in round-robin fashion.
+     * For each channel: find |G_i| peaks, Newton-adjust interpolation freqs,
+     * re-run coupled continuation. Repeat until equioscillation or max iters.
+     */
+    void run_equiripple(std::vector<std::vector<double>>& interp_freqs);
+
+    /**
+     * Solve the full coupled system at given interpolation frequencies.
+     * Returns true on success, updates cms_.
+     */
+    bool solve_coupled(const std::vector<std::vector<double>>& interp_freqs);
+
+    /**
+     * Find |G_i| peaks in intervals between interpolation frequencies for channel i.
+     * Returns order+1 peak magnitudes.
+     */
+    std::vector<double> find_channel_peaks(int ch, const std::vector<double>& interp_freqs) const;
+
     std::vector<ChannelSpec> specs_;
     Manifold manifold_;
     std::vector<MatrixXcd> cms_;

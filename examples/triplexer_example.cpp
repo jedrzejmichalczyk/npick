@@ -49,6 +49,7 @@ int main() {
 
     MultiplexerMatching mux(specs, center_freq);
     mux.verbose = true;
+    mux.equiripple_outer_iterations = 3;
 
     auto t0 = std::chrono::steady_clock::now();
     auto cms = mux.run();
