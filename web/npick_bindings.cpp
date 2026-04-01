@@ -126,28 +126,48 @@ public:
         };
 
         try {
-            ImpedanceMatching matcher(load_fn_, order, tzs, return_loss_db,
-                                      norm_left, norm_right);
-            matcher.verbose = false;
-            matcher.optimizer_max_iterations = 0;
+            // Try with requested return loss first, then relax if needed
+            double rl_attempts[] = { return_loss_db,
+                                     std::min(return_loss_db, 12.0),
+                                     std::min(return_loss_db, 8.0),
+                                     std::min(return_loss_db, 5.0) };
+            double step_sizes[] = { -0.05, -0.02, -0.01, -0.01 };
 
-            MatrixXcd cm = matcher.run();
+            for (int attempt = 0; attempt < 4; ++attempt) {
+                double rl = rl_attempts[attempt];
+                if (attempt > 0 && rl >= rl_attempts[attempt - 1])
+                    continue;  // skip if same as previous
 
-            if (cm.size() == 0) {
-                error_message_ = "Solver failed to produce a coupling matrix";
-                return false;
+                try {
+                    ImpedanceMatching matcher(load_fn_, order, tzs, rl,
+                                              norm_left, norm_right);
+                    matcher.verbose = false;
+                    matcher.optimizer_max_iterations = 0;
+                    matcher.path_tracker_h = step_sizes[attempt];
+
+                    MatrixXcd cm = matcher.run();
+
+                    if (cm.size() == 0)
+                        continue;
+
+                    success_ = true;
+                    achieved_rl_db_ = matcher.achieved_return_loss_db();
+                    cm_ = cm;
+                    cm_size_ = cm.rows();
+
+                    interp_freqs_.assign(
+                        matcher.interpolation_freqs().begin(),
+                        matcher.interpolation_freqs().end());
+
+                    return true;
+                } catch (...) {
+                    continue;
+                }
             }
 
-            success_ = true;
-            achieved_rl_db_ = matcher.achieved_return_loss_db();
-            cm_ = cm;
-            cm_size_ = cm.rows();
-
-            interp_freqs_.assign(
-                matcher.interpolation_freqs().begin(),
-                matcher.interpolation_freqs().end());
-
-            return true;
+            error_message_ = "Solver could not converge. Try a narrower band, "
+                             "lower order, or lower return loss.";
+            return false;
 
         } catch (const std::exception& e) {
             error_message_ = e.what();
