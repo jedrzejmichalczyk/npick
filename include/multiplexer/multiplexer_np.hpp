@@ -46,6 +46,30 @@ public:
      */
     std::vector<MatrixXcd> extract_coupling_matrices(const VectorXcd& x) const;
 
+    /**
+     * Run the Martinez continuation: Euler predictor + Newton corrector.
+     * Ramps lambda from 0 to 1, starting from the independent solutions in x.
+     * Returns true if lambda=1 is reached.
+     */
+    bool run_continuation(VectorXcd& x, double lambda_step = 0.05,
+                          int max_steps = 200, int newton_max_iter = 20,
+                          double newton_tol = 1e-9, bool verbose = false);
+
+    /**
+     * Compute residual F(P, lambda) = f(p_i) - L_i(P, lambda) for all channels.
+     */
+    VectorXcd compute_residual(const VectorXcd& x, double lambda) const;
+
+    /**
+     * Compute Jacobian dF/dp at given (x, lambda).
+     */
+    MatrixXcd compute_jacobian_dp(const VectorXcd& x, double lambda) const;
+
+    /**
+     * Compute dF/dlambda at given (x, lambda).
+     */
+    VectorXcd compute_dF_dlambda(const VectorXcd& x, double lambda) const;
+
     int num_channels() const { return num_channels_; }
 
 private:

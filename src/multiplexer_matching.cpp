@@ -38,41 +38,77 @@ std::vector<MatrixXcd> MultiplexerMatching::run() {
                                            specs_[i].order);
     }
 
-    // Step 3: Run coupled homotopy
-    if (verbose) std::cout << "  Step 2-3: Running coupled homotopy continuation...\n";
+    // Step 3: Solve independent NP problems for start solution, then coupled continuation
+    if (verbose) std::cout << "  Step 2: Solving independent channel matching...\n";
 
     try {
         MultiplexerNevanlinnaPick mux_np(manifold_, specs_, interp_freqs);
 
-        PathTracker tracker(&mux_np);
-        tracker.h = path_tracker_h;
-        tracker.run_tol = path_tracker_run_tol;
-        tracker.final_tol = path_tracker_final_tol;
-        tracker.verbose = false;
-        tracker.max_iterations = 2000;
-
-        VectorXcd x0 = mux_np.get_start_solution();
-
         if (verbose) {
             std::cout << "  System size: " << mux_np.get_num_variables() << " variables, "
                       << N << " channels\n";
-            // Verify start
-            VectorXcd H0 = mux_np.calc_homotopy_function(x0, 1.0);
-            std::cout << "  Start residual: " << H0.norm()
-                      << " (max component: " << H0.lpNorm<Eigen::Infinity>() << ")\n";
-            for (int k = 0; k < std::min(static_cast<int>(H0.size()), 12); ++k) {
-                std::cout << "    H[" << k << "] = " << H0(k) << "\n";
-            }
-            // Debug: verify init_sparams matches eval at start
-            VectorXcd x0_copy = x0;
-            VectorXcd H_at_1 = mux_np.calc_homotopy_function(x0_copy, 1.0);
-            std::cout << "  H(x0,1) should be 0: " << H_at_1.norm() << "\n";
         }
 
-        VectorXcd solution = tracker.run(x0);
+        // Solve the decoupled problem F(P, 0) = 0 using Newton iteration.
+        // At lambda=0, each channel is independent: f(p_i) = J_ii.
+        // Start from Chebyshev prototype and Newton-correct to exact solution.
+        VectorXcd x = mux_np.get_start_solution();
+
+        if (verbose) {
+            VectorXcd F0 = mux_np.compute_residual(x, 0.0);
+            std::cout << "  Chebyshev residual at lambda=0: " << F0.norm() << "\n";
+        }
+
+        // Newton iterations to solve F(x, 0) = 0
+        for (int iter = 0; iter < 50; ++iter) {
+            VectorXcd F = mux_np.compute_residual(x, 0.0);
+            double res = F.norm();
+            if (res < 1e-10) break;
+
+            MatrixXcd J = mux_np.compute_jacobian_dp(x, 0.0);
+            VectorXcd dx = J.colPivHouseholderQr().solve(-F);
+            x += dx;
+
+            if (dx.norm() < 1e-12) break;
+        }
+
+        VectorXcd F0 = mux_np.compute_residual(x, 0.0);
+        if (verbose) {
+            std::cout << "  Residual at lambda=0 after Newton: " << F0.norm() << "\n";
+        }
+
+        if (F0.norm() > 1e-6) {
+            throw std::runtime_error("Failed to solve decoupled problem");
+        }
+
+        // Diagnostics: check Jacobian condition
+        if (verbose) {
+            MatrixXcd Jac = mux_np.compute_jacobian_dp(x, 0.0);
+            Eigen::JacobiSVD<MatrixXcd> svd(Jac);
+            auto sv = svd.singularValues();
+            std::cout << "  Jacobian SVs: max=" << sv(0) << " min=" << sv(sv.size()-1)
+                      << " cond=" << sv(0)/sv(sv.size()-1) << "\n";
+
+            VectorXcd dFdl = mux_np.compute_dF_dlambda(x, 0.0);
+            std::cout << "  |dF/dlambda|=" << dFdl.norm() << "\n";
+
+            VectorXcd dp_pred = Jac.colPivHouseholderQr().solve(-dFdl * 0.001);
+            std::cout << "  |Euler step (h=0.001)|=" << dp_pred.norm() << "\n";
+        }
+
+        // Step 3: Martinez continuation from lambda=0 to lambda=1
+        if (verbose) std::cout << "  Step 3: Running coupled continuation (lambda: 0 -> 1)...\n";
+
+        bool coupled_ok = mux_np.run_continuation(x, 0.001, 2000, 30, 1e-6, verbose);
+
+        if (coupled_ok) {
+            if (verbose) std::cout << "  Coupled continuation converged!\n";
+        } else {
+            if (verbose) std::cout << "  Coupled continuation did not reach lambda=1\n";
+        }
 
         // Step 4: Extract coupling matrices
-        cms_ = mux_np.extract_coupling_matrices(solution);
+        cms_ = mux_np.extract_coupling_matrices(x);
 
         // Compute achieved return losses
         achieved_rls_.resize(N);
