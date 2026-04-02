@@ -470,7 +470,7 @@ Complex MultiplexerNevanlinnaPick::eval_coupled_load(
     MatrixXcd I = MatrixXcd::Identity(dim, dim);
     MatrixXcd M = I - Fi * Wi;
     MatrixXcd M_inv = M.inverse();
-    Complex coupling = (Vi.adjoint() * M_inv * Fi * Vi)(0, 0);
+    Complex coupling = (Vi.transpose() * M_inv * Fi * Vi)(0, 0);
 
     return J_ii + lambda * coupling;
 }
@@ -545,7 +545,7 @@ VectorXcd MultiplexerNevanlinnaPick::compute_residual(
                     col++;
                 }
                 MatrixXcd I_dim = MatrixXcd::Identity(dim, dim);
-                Complex coupling = (vi.adjoint() * (I_dim - Fi_mat * wi).inverse()
+                Complex coupling = (vi.transpose() * (I_dim - Fi_mat * wi).inverse()
                                     * Fi_mat * vi)(0, 0);
                 Li = J_ii + lambda * coupling;
             }
@@ -619,22 +619,49 @@ MatrixXcd MultiplexerNevanlinnaPick::compute_jacobian_dp(
                     Complex s_j(0, norm_freq_j);
 
                     // Precompute coupling vectors for rank-1 update
-                    // dL = (v^H S)_{j_in_Fi} * df * (WSF_I v)_{j_in_Fi}
-                    VectorXcd vHS = S.adjoint() * vi;      // S^H v
+                    // dL = (v^T S)_{j_in_Fi} * df * (WSF_I v)_{j_in_Fi}
+                    VectorXcd vTS = S.transpose() * vi;    // S^T v
                     VectorXcd WSF_Iv = WSF_I * vi;
 
-                    Complex left  = std::conj(vHS(j_in_Fi));  // (v^H S)_{j_in_Fi}
+                    Complex left  = vTS(j_in_Fi);           // (v^T S)_{j_in_Fi}
                     Complex right = WSF_Iv(j_in_Fi);
 
                     for (int v = 0; v < ch_j.num_vars; ++v) {
                         Complex df_j_dpv = polys[j].eval_df(v, s_j);
                         Complex dL = left * df_j_dpv * right;
                         Jac(ch_i.eq_offset + m, ch_j.var_offset + v) =
-                            -lambda * std::conj(dL);
+                            -lambda * dL;
                     }
                 }
             }
         }
+    }
+
+    // One-time FD Jacobian check
+    static bool checked = false;
+    if (!checked && std::abs(lambda) > 0.1) {
+        checked = true;
+        double eps = 1e-7;
+        MatrixXcd Jac_fd = MatrixXcd::Zero(total_eqs_, total_vars_);
+        VectorXcd F0 = compute_residual(x, lambda);
+        for (int j = 0; j < total_vars_; ++j) {
+            VectorXcd x_pert = x;
+            x_pert(j) += eps;
+            VectorXcd F1 = compute_residual(x_pert, lambda);
+            Jac_fd.col(j) = (F1 - F0) / eps;
+        }
+        double max_err = 0;
+        int worst_r = 0, worst_c = 0;
+        for (int r = 0; r < total_eqs_; ++r)
+            for (int c = 0; c < total_vars_; ++c) {
+                double err = std::abs(Jac(r,c) - Jac_fd(r,c));
+                if (err > max_err) { max_err = err; worst_r = r; worst_c = c; }
+            }
+        std::cout << "  JAC CHECK: max_err=" << max_err
+                  << " at (" << worst_r << "," << worst_c << ")"
+                  << " analytical=" << Jac(worst_r,worst_c)
+                  << " FD=" << Jac_fd(worst_r,worst_c)
+                  << " |Jac|=" << Jac.norm() << " |Jac_fd|=" << Jac_fd.norm() << "\n";
     }
 
     return Jac;
@@ -670,7 +697,7 @@ VectorXcd MultiplexerNevanlinnaPick::compute_dF_dlambda(
                 col++;
             }
             MatrixXcd I_dim = MatrixXcd::Identity(dim, dim);
-            Complex coupling = (vi.adjoint() * (I_dim - Fi_mat * wi).inverse()
+            Complex coupling = (vi.transpose() * (I_dim - Fi_mat * wi).inverse()
                                 * Fi_mat * vi)(0, 0);
             dFdl(ch.eq_offset + m) = -coupling;
         }
@@ -686,7 +713,24 @@ bool MultiplexerNevanlinnaPick::run_continuation(
     double h = lambda_step;
 
     std::ofstream path_log("continuation_path.csv");
-    path_log << "step,lambda,h,residual,newton_iters,dx_norm,x_norm,predictor_res\n";
+    path_log << "step,lambda,h,residual,newton_iters,dx_norm,x_norm,predictor_res,cond,tangent_norm";
+    for (int i = 0; i < total_vars_; ++i)
+        path_log << ",x" << i << "_re,x" << i << "_im";
+    path_log << "\n";
+
+    // Log starting point at lambda=0
+    {
+        auto write_x = [&](const VectorXcd& v) {
+            for (int i = 0; i < total_vars_; ++i)
+                path_log << "," << v(i).real() << "," << v(i).imag();
+        };
+        path_log << -1 << "," << 0.0 << "," << 0 << ","
+                 << compute_residual(x, 0.0).norm() << ","
+                 << 0 << "," << 0 << "," << x.norm() << "," << 0
+                 << "," << 0 << "," << 0;
+        write_x(x);
+        path_log << "\n";
+    }
 
     for (int step = 0; step < max_steps && lambda < 1.0 - 1e-12; ++step) {
         if (lambda + h > 1.0) h = 1.0 - lambda;
@@ -695,61 +739,54 @@ bool MultiplexerNevanlinnaPick::run_continuation(
         MatrixXcd Jp = compute_jacobian_dp(x, lambda);
         VectorXcd dFdl = compute_dF_dlambda(x, lambda);
 
-        // QR factorize once — reused for predictor and all Newton iterations
+        // Condition number via SVD
+        Eigen::JacobiSVD<MatrixXcd> svd(Jp);
+        auto sv = svd.singularValues();
+        double cond = (sv(sv.size()-1) > 1e-15) ? sv(0)/sv(sv.size()-1) : 1e15;
+
+        // Tangent: dx/dlambda = -J^{-1} * dF/dlambda (unit step)
         auto Jp_qr = Jp.colPivHouseholderQr();
+        VectorXcd tangent = Jp_qr.solve(-dFdl);
+        double tangent_norm = tangent.norm();
 
         // Euler predictor
-        VectorXcd dx = Jp_qr.solve(-dFdl * h);
+        VectorXcd dx = tangent * h;
         VectorXcd x_pred = x + dx;
         double new_lambda = lambda + h;
 
         double predictor_res = compute_residual(x_pred, new_lambda).norm();
 
-        // Modified Newton: Jacobian at predicted point, reused for all iterations
-        MatrixXcd Jp_corr = compute_jacobian_dp(x_pred, new_lambda);
-        auto Jp_corr_qr = Jp_corr.colPivHouseholderQr();
-
+        // Full Newton corrector
         bool converged = false;
         int newton_iters = 0;
-        bool refreshed = false;
         for (int iter = 0; iter < newton_max_iter; ++iter) {
             VectorXcd F = compute_residual(x_pred, new_lambda);
             double res = F.norm();
 
-            if (verbose && step < 5) {
-                std::cout << "      Newton iter " << iter << ": res=" << res << "\n";
+            if (verbose && step < 3) {
+                std::cout << "      Newton " << iter << ": res=" << std::scientific
+                          << std::setprecision(3) << res;
             }
 
             if (res < newton_tol) {
+                if (verbose && step < 3) std::cout << "\n";
                 converged = true;
                 newton_iters = iter + 1;
                 break;
             }
 
-            VectorXcd correction = Jp_corr_qr.solve(-F);
+            MatrixXcd Jc = compute_jacobian_dp(x_pred, new_lambda);
+            VectorXcd correction = Jc.colPivHouseholderQr().solve(-F);
 
             double alpha = 1.0;
-            bool stepped = false;
             for (int ls = 0; ls < 10; ++ls) {
                 VectorXcd x_try = x_pred + alpha * correction;
                 double res_try = compute_residual(x_try, new_lambda).norm();
-                if (res_try < res) {
-                    x_pred = x_try;
-                    stepped = true;
-                    break;
-                }
+                if (res_try < res) { x_pred = x_try; break; }
                 alpha *= 0.5;
             }
-
-            if (!stepped || alpha < 1e-8) {
-                if (!refreshed) {
-                    Jp_corr = compute_jacobian_dp(x_pred, new_lambda);
-                    Jp_corr_qr = Jp_corr.colPivHouseholderQr();
-                    refreshed = true;
-                    continue;
-                }
-                break;
-            }
+            if (verbose && step < 3) std::cout << "\n";
+            if (alpha < 1e-8) break;
             newton_iters = iter + 1;
         }
 
@@ -761,7 +798,11 @@ bool MultiplexerNevanlinnaPick::run_continuation(
             path_log << step << "," << lambda << "," << h << ","
                      << compute_residual(x, lambda).norm() << ","
                      << newton_iters << "," << dx_norm << ","
-                     << x.norm() << "," << predictor_res << "\n";
+                     << x.norm() << "," << predictor_res
+                     << "," << cond << "," << tangent_norm;
+            for (int i = 0; i < total_vars_; ++i)
+                path_log << "," << x(i).real() << "," << x(i).imag();
+            path_log << "\n";
 
             if (verbose && (step % 20 == 0 || lambda >= 1.0 - 1e-12)) {
                 VectorXcd F = compute_residual(x, lambda);
@@ -771,11 +812,14 @@ bool MultiplexerNevanlinnaPick::run_continuation(
                           << " newton=" << newton_iters << "\n";
             }
 
-            // Adaptive step: grow faster when Newton converges quickly
-            if (newton_iters <= 3)
-                h = std::min(h * 2.0, 0.1);
+            // Adaptive step based on predictor quality
+            double pred_ratio = predictor_res / newton_tol;
+            if (pred_ratio < 10.0)
+                h = std::min(h * 2.0, 1.0 - lambda);
+            else if (pred_ratio < 100.0)
+                h = std::min(h * 1.5, 1.0 - lambda);
             else
-                h = std::min(h * 1.5, 0.1);
+                h = std::min(h * 1.2, 1.0 - lambda);
         } else {
             h *= 0.5;
             if (h < 1e-12) {

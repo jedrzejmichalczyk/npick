@@ -283,8 +283,8 @@ bool MultiplexerMatching::solve_coupled(
 
         if (mux_np.compute_residual(x, 0.0).norm() > 1e-4) return false;
 
-        // Coupled continuation — larger initial step for speed
-        bool ok = mux_np.run_continuation(x, 0.01, 500, 20, 1e-6, false);
+        // Coupled continuation
+        bool ok = mux_np.run_continuation(x, 0.001, 2000, 30, 1e-6, false);
         if (!ok) return false;
 
         cms_ = mux_np.extract_coupling_matrices(x);
@@ -312,109 +312,198 @@ bool MultiplexerMatching::solve_coupled(
 void MultiplexerMatching::run_equiripple(
     std::vector<std::vector<double>>& interp_freqs)
 {
-    // Exchange-based equiripple: one coupled re-solve per iteration.
-    // 1. Find |G_i| peaks using CURRENT coupling matrices (cheap)
-    // 2. Move interpolation frequencies toward worst peaks for ALL channels
-    // 3. Re-solve coupled system ONCE with new frequencies
-    // 4. Repeat
+    // Newton on per-channel peak-difference system, same approach as single-channel.
+    // Variables: all interpolation frequencies (concatenated).
+    // Residual per channel: F_ch = [h0-h1, h1-h2, ..., h(n-1)-hn] where h_k = peak in interval k.
+    // FD Jacobian: perturb each frequency, full re-solve, recompute peaks.
 
     int N = static_cast<int>(specs_.size());
+
+    // Flatten frequency vector and build index map
+    int total_freqs = 0;
+    std::vector<int> ch_offset(N), ch_nfreqs(N);
+    for (int ch = 0; ch < N; ++ch) {
+        ch_offset[ch] = total_freqs;
+        ch_nfreqs[ch] = static_cast<int>(interp_freqs[ch].size());
+        total_freqs += ch_nfreqs[ch];
+    }
+
+    // Helper: flatten interp_freqs to vector
+    auto flatten = [&](const std::vector<std::vector<double>>& freqs) {
+        Eigen::VectorXd v(total_freqs);
+        for (int ch = 0; ch < N; ++ch)
+            for (int k = 0; k < ch_nfreqs[ch]; ++k)
+                v(ch_offset[ch] + k) = freqs[ch][k];
+        return v;
+    };
+
+    // Helper: unflatten vector back to interp_freqs
+    auto unflatten = [&](const Eigen::VectorXd& v) {
+        std::vector<std::vector<double>> freqs(N);
+        for (int ch = 0; ch < N; ++ch) {
+            freqs[ch].resize(ch_nfreqs[ch]);
+            for (int k = 0; k < ch_nfreqs[ch]; ++k)
+                freqs[ch][k] = v(ch_offset[ch] + k);
+        }
+        return freqs;
+    };
+
+    // Helper: compute per-channel peaks and form residual
+    // Returns (residual_vector, max_peak_across_all_channels)
+    auto compute_peaks_and_residual = [&](double& max_peak_out) {
+        Eigen::VectorXd F(total_freqs);
+        max_peak_out = 0;
+        for (int ch = 0; ch < N; ++ch) {
+            auto peaks = find_channel_peaks(ch, interp_freqs[ch]);
+            for (int k = 0; k < ch_nfreqs[ch]; ++k)
+                F(ch_offset[ch] + k) = peaks[k] - peaks[k + 1];
+            double ch_max = *std::max_element(peaks.begin(), peaks.end());
+            if (ch_max > max_peak_out) max_peak_out = ch_max;
+        }
+        return F;
+    };
+
+    // Initial state
     auto best_cms = cms_;
     auto best_rls = achieved_rls_;
     auto best_freqs = interp_freqs;
 
-    for (int iter = 0; iter < equiripple_outer_iterations; ++iter) {
-        bool any_moved = false;
+    double max_peak = 0;
+    Eigen::VectorXd F = compute_peaks_and_residual(max_peak);
+    double best_max_peak = max_peak;
 
-        // For each channel: find peaks and move interpolation frequencies
+    if (verbose) {
         for (int ch = 0; ch < N; ++ch) {
-            auto& ifreqs = interp_freqs[ch];
-            int n = static_cast<int>(ifreqs.size());
-            double fl = specs_[ch].freq_left;
-            double fr = specs_[ch].freq_right;
-            double bw = fr - fl;
+            auto peaks = find_channel_peaks(ch, interp_freqs[ch]);
+            double mx = *std::max_element(peaks.begin(), peaks.end());
+            double mn = *std::min_element(peaks.begin(), peaks.end());
+            std::cout << "    Ch" << (ch+1) << ": worst=" << std::fixed
+                      << std::setprecision(1) << to_db(mx) << " dB, spread="
+                      << (to_db(mx) - to_db(mn)) << " dB\n";
+        }
+    }
 
-            // Find peak locations in each interval (cheap: just eval_S)
-            std::vector<double> boundaries;
-            boundaries.push_back(fl);
-            for (double f : ifreqs) boundaries.push_back(f);
-            boundaries.push_back(fr);
+    for (int iter = 0; iter < equiripple_outer_iterations; ++iter) {
+        // FD Jacobian: perturb each frequency, full re-solve, recompute peaks
+        Eigen::MatrixXd J(total_freqs, total_freqs);
+        bool jac_ok = true;
 
-            std::vector<double> peak_freqs(n + 1);
-            std::vector<double> peak_mags(n + 1);
-            for (int seg = 0; seg <= n; ++seg) {
-                double left = boundaries[seg], right = boundaries[seg + 1];
-                double best_f = (left + right) / 2.0, best_m = 0;
-                int pts = std::max(40 / (n + 1), 8);
-                for (int i = 0; i <= pts; ++i) {
-                    double f = left + (right - left) * i / static_cast<double>(pts);
-                    double m = std::abs(eval_channel_response(ch, f));
-                    if (std::isfinite(m) && m > best_m) { best_m = m; best_f = f; }
+        for (int j = 0; j < total_freqs && jac_ok; ++j) {
+            int ch_j = 0;
+            while (ch_j < N - 1 && j >= ch_offset[ch_j + 1]) ch_j++;
+            double bw = specs_[ch_j].freq_right - specs_[ch_j].freq_left;
+            double fd_delta = 1e-5 * bw;
+
+            auto freqs_pert = interp_freqs;
+            int k_in_ch = j - ch_offset[ch_j];
+            freqs_pert[ch_j][k_in_ch] += fd_delta;
+
+            if (!solve_coupled(freqs_pert)) {
+                // Try negative perturbation
+                freqs_pert = interp_freqs;
+                freqs_pert[ch_j][k_in_ch] -= fd_delta;
+                fd_delta = -fd_delta;
+                if (!solve_coupled(freqs_pert)) {
+                    if (verbose) std::cout << "    FD solve failed for freq " << j << "\n";
+                    jac_ok = false;
+                    break;
                 }
-                peak_freqs[seg] = best_f;
-                peak_mags[seg] = best_m;
             }
 
-            double max_peak = *std::max_element(peak_mags.begin(), peak_mags.end());
-            double min_peak = *std::min_element(peak_mags.begin(), peak_mags.end());
-
-            if (verbose && iter == 0) {
-                std::cout << "    Ch" << (ch + 1) << ": worst="
-                          << std::fixed << std::setprecision(1) << to_db(max_peak)
-                          << " dB, spread=" << (to_db(max_peak) - to_db(min_peak)) << " dB\n";
+            double dummy;
+            // Temporarily swap in perturbed CMs for peak evaluation
+            auto saved_cms = cms_;
+            // cms_ was updated by solve_coupled
+            Eigen::VectorXd F_pert(total_freqs);
+            for (int ch = 0; ch < N; ++ch) {
+                auto peaks_p = find_channel_peaks(ch, freqs_pert[ch]);
+                for (int k = 0; k < ch_nfreqs[ch]; ++k)
+                    F_pert(ch_offset[ch] + k) = peaks_p[k] - peaks_p[k + 1];
             }
+            cms_ = saved_cms;  // restore
 
-            if (max_peak - min_peak < 1e-4 * max_peak) continue;
-
-            // Move interpolation points: each point moves toward the midpoint
-            // of its two adjacent peaks, with relaxation
-            double relax = 0.3;
-            for (int k = 0; k < n; ++k) {
-                double target = (peak_freqs[k] + peak_freqs[k + 1]) / 2.0;
-                ifreqs[k] += relax * (target - ifreqs[k]);
-                ifreqs[k] = std::clamp(ifreqs[k], fl + bw * 0.02, fr - bw * 0.02);
-            }
-            std::sort(ifreqs.begin(), ifreqs.end());
-
-            // Ensure minimum spacing
-            double min_gap = bw * 0.02;
-            for (int k = 1; k < n; ++k) {
-                if (ifreqs[k] - ifreqs[k-1] < min_gap)
-                    ifreqs[k] = ifreqs[k-1] + min_gap;
-            }
-
-            any_moved = true;
+            for (int i = 0; i < total_freqs; ++i)
+                J(i, j) = (F_pert(i) - F(i)) / fd_delta;
         }
 
-        if (!any_moved) break;
+        if (!jac_ok) break;
 
-        // One coupled re-solve with all updated frequencies
-        if (solve_coupled(interp_freqs)) {
-            // Check improvement
-            double worst_now = *std::min_element(achieved_rls_.begin(), achieved_rls_.end());
-            double worst_best = *std::min_element(best_rls.begin(), best_rls.end());
+        // Restore coupling matrices from best/current state
+        if (!solve_coupled(interp_freqs)) break;
 
-            if (worst_now < worst_best) {
-                best_cms = cms_;
-                best_rls = achieved_rls_;
-                best_freqs = interp_freqs;
+        // Newton step
+        Eigen::VectorXd dx = J.colPivHouseholderQr().solve(-F);
+
+        // Clamp step
+        double max_step = 0;
+        for (int ch = 0; ch < N; ++ch) {
+            double bw = specs_[ch].freq_right - specs_[ch].freq_left;
+            if (bw > max_step) max_step = bw;
+        }
+        max_step *= 0.25;
+        double scale = 1.0;
+        for (int i = 0; i < total_freqs; ++i)
+            if (std::abs(dx(i)) > max_step)
+                scale = std::min(scale, max_step / std::abs(dx(i)));
+        dx *= scale;
+
+        // Line search on max(peak)
+        double alpha = 1.0;
+        bool accepted = false;
+        for (int ls = 0; ls < 8; ++ls) {
+            Eigen::VectorXd v = flatten(interp_freqs) + alpha * dx;
+            auto freqs_new = unflatten(v);
+
+            // Clamp to passband
+            for (int ch = 0; ch < N; ++ch) {
+                double fl = specs_[ch].freq_left;
+                double fr = specs_[ch].freq_right;
+                double bw = fr - fl;
+                for (auto& f : freqs_new[ch])
+                    f = std::clamp(f, fl + bw * 0.02, fr - bw * 0.02);
+                std::sort(freqs_new[ch].begin(), freqs_new[ch].end());
             }
 
-            if (verbose) {
-                std::cout << "    Iter " << iter << ":";
-                for (int i = 0; i < N; ++i)
-                    std::cout << " Ch" << (i+1) << "=" << std::fixed
-                              << std::setprecision(1) << achieved_rls_[i] << "dB";
-                std::cout << "\n";
+            if (solve_coupled(freqs_new)) {
+                double new_max = 0;
+                for (int ch = 0; ch < N; ++ch) {
+                    auto peaks = find_channel_peaks(ch, freqs_new[ch]);
+                    double mx = *std::max_element(peaks.begin(), peaks.end());
+                    if (mx > new_max) new_max = mx;
+                }
+
+                if (new_max < max_peak || ls == 7) {
+                    interp_freqs = freqs_new;
+                    max_peak = new_max;
+                    F = compute_peaks_and_residual(max_peak);
+                    accepted = true;
+
+                    if (new_max < best_max_peak) {
+                        best_max_peak = new_max;
+                        best_cms = cms_;
+                        best_rls = achieved_rls_;
+                        best_freqs = interp_freqs;
+                    }
+                    break;
+                }
             }
-        } else {
-            // Re-solve failed, revert and stop
-            if (verbose) std::cout << "    Re-solve failed at iter " << iter << "\n";
+            alpha *= 0.5;
+        }
+
+        if (verbose) {
+            std::cout << "    Iter " << iter << ": max|G|="
+                      << std::fixed << std::setprecision(1) << to_db(max_peak) << " dB";
+            for (int i = 0; i < N; ++i)
+                std::cout << " Ch" << (i+1) << "=" << achieved_rls_[i] << "dB";
+            std::cout << " alpha=" << std::setprecision(3) << alpha << "\n";
+        }
+
+        if (!accepted) {
+            if (verbose) std::cout << "    Line search failed\n";
             break;
         }
     }
 
-    // Keep best result
     cms_ = best_cms;
     achieved_rls_ = best_rls;
     interp_freqs = best_freqs;
