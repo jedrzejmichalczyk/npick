@@ -77,8 +77,11 @@ async function initWasm() {
         Module = await createNpickModule();
         solver = new Module.SolverWrapper();
         statusEl.className = '';
+        // Push already-loaded default data to the solver
+        if (loadData && loadData.freqs.length >= 3) {
+            solver.set_load_data(loadData.freqs, loadData.re, loadData.im);
+        }
         updateRunButton();
-        loadDefaultData();
     } catch (e) {
         statusEl.textContent = 'Failed to load WASM module: ' + e.message;
         statusEl.className = 'error';
@@ -453,3 +456,6 @@ function fmtFreq(f) {
 
 freqLeftEl.addEventListener('change', plotLoad);
 freqRightEl.addEventListener('change', plotLoad);
+
+// Load default data immediately so the plot is visible on page load
+loadDefaultData();
