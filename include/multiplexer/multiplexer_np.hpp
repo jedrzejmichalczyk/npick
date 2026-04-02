@@ -70,6 +70,30 @@ public:
      */
     VectorXcd compute_dF_dlambda(const VectorXcd& x, double lambda) const;
 
+    /**
+     * Frequency-shift continuation: move interpolation frequencies from
+     * current to target while maintaining F(P) = 0.
+     *
+     * Uses the same Euler+Newton machinery as run_continuation but
+     * blends interpolation frequencies instead of coupling lambda.
+     * Start: current interp_freqs (x already satisfies F=0 at lambda=1).
+     * End: target_freqs.
+     *
+     * Returns true if converged. Updates internal frequencies on success.
+     */
+    bool shift_frequencies(VectorXcd& x,
+                           const std::vector<std::vector<double>>& target_freqs,
+                           double step = 0.1, int max_steps = 100,
+                           int newton_max = 15, double newton_tol = 1e-7,
+                           bool verbose = false);
+
+    /**
+     * Get current interpolation frequencies (may have been shifted).
+     */
+    const std::vector<double>& channel_interp_freqs(int ch) const {
+        return channels_[ch].interp_freqs;
+    }
+
     int num_channels() const { return num_channels_; }
 
 private:

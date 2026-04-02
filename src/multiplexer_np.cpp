@@ -5,9 +5,179 @@
 #include <numeric>
 #include <iostream>
 #include <iomanip>
+#include <fstream>
 #include <Eigen/Dense>
 
 namespace np {
+
+namespace {
+
+// Convert descending VectorXcd to ascending Polynomial<Complex>
+Polynomial<Complex> desc_to_poly(const VectorXcd& desc) {
+    std::vector<Complex> asc(desc.size());
+    for (int i = 0; i < desc.size(); ++i)
+        asc[i] = desc(desc.size() - 1 - i);
+    return Polynomial<Complex>(asc);
+}
+
+// Precomputed polynomial state for one channel.
+// Caches spectral factor q and optionally Bezout derivative polynomials dq/dp_v.
+struct ChannelPolyState {
+    Polynomial<Complex> p_poly;
+    Polynomial<Complex> q_poly;
+
+    // Bezout derivatives (only populated when with_derivatives=true)
+    std::vector<Polynomial<Complex>> dq_polys; // dq/dp_v for each free variable v
+    std::vector<int> dp_degrees;               // degree of dp monomial per variable
+
+    Complex eval_f(Complex s) const {
+        Complex q_val = q_poly.evaluate(s);
+        return (std::abs(q_val) > 1e-15) ? p_poly.evaluate(s) / q_val : Complex(0);
+    }
+
+    Complex eval_df(int v, Complex s) const {
+        Complex p_val = p_poly.evaluate(s);
+        Complex q_val = q_poly.evaluate(s);
+        if (std::abs(q_val) < 1e-15) return Complex(0);
+        Complex dp_val = std::pow(s, dp_degrees[v]);
+        Complex dq_val = dq_polys[v].evaluate(s);
+        return (dp_val * q_val - p_val * dq_val) / (q_val * q_val);
+    }
+};
+
+// Build ChannelPolyState: one feldtkeller call per channel + optional Bezout solve.
+// p_desc: full monic descending coefficients (including leading 1)
+// r_desc: transmission polynomial descending coefficients
+ChannelPolyState build_poly_state(
+    const VectorXcd& p_desc,
+    const VectorXcd& r_desc,
+    int num_vars,
+    bool with_derivatives)
+{
+    ChannelPolyState st;
+    st.p_poly = desc_to_poly(p_desc);
+    auto r_poly = desc_to_poly(r_desc);
+    st.q_poly = SpectralFactor::feldtkeller(st.p_poly, r_poly);
+
+    if (!with_derivatives) return st;
+
+    int N = static_cast<int>(p_desc.size());
+    st.dq_polys.resize(num_vars);
+    st.dp_degrees.resize(num_vars);
+
+    auto p_para = st.p_poly.para_conjugate();
+    auto q_para = st.q_poly.para_conjugate();
+    int q_deg = st.q_poly.degree();
+    int lhs_max_deg = q_deg + (N - 1);
+    int num_eqs = lhs_max_deg + 1;
+
+    double max_imag_q = 0, max_real_q = 0;
+    for (const auto& c : st.q_poly.coefficients) {
+        max_imag_q = std::max(max_imag_q, std::abs(c.imag()));
+        max_real_q = std::max(max_real_q, std::abs(c.real()));
+    }
+    bool q_is_real = max_imag_q < 1e-10 * std::max(1.0, max_real_q);
+
+    if (q_is_real) {
+        Eigen::MatrixXd A = Eigen::MatrixXd::Zero(2 * num_eqs, N);
+        for (int k = 0; k < num_eqs; ++k) {
+            double sign_i = 1.0;
+            for (int i = 0; i < N; ++i) {
+                int j = k - i;
+                if (j >= 0 && j <= q_deg) {
+                    Complex q_para_c = q_para.coefficients[j];
+                    Complex q_c = st.q_poly.coefficients[j];
+                    Complex coeff = q_para_c + q_c * sign_i;
+                    A(2 * k, i) += coeff.real();
+                    A(2 * k + 1, i) += coeff.imag();
+                }
+                sign_i = -sign_i;
+            }
+        }
+        auto qr = A.colPivHouseholderQr();
+
+        for (int v = 0; v < num_vars; ++v) {
+            int coeff_idx = v + 1;
+            int deg = N - 1 - coeff_idx;
+            st.dp_degrees[v] = deg;
+
+            std::vector<Complex> dp_c(deg + 1, Complex(0));
+            dp_c[deg] = Complex(1);
+            Polynomial<Complex> dp(dp_c);
+            auto rhs_poly = dp * p_para + st.p_poly * dp.para_conjugate();
+
+            int rhs_deg = rhs_poly.degree();
+            Eigen::VectorXd b = Eigen::VectorXd::Zero(2 * num_eqs);
+            for (int k = 0; k < num_eqs; ++k) {
+                Complex rc = (k <= rhs_deg) ? rhs_poly.coefficients[k] : Complex(0);
+                b(2 * k) = rc.real();
+                b(2 * k + 1) = rc.imag();
+            }
+
+            Eigen::VectorXd sol = qr.solve(b);
+            std::vector<Complex> dq_c(N);
+            for (int i = 0; i < N; ++i)
+                dq_c[i] = Complex(sol(i), 0);
+            st.dq_polys[v] = Polynomial<Complex>(dq_c);
+        }
+    } else {
+        Eigen::MatrixXd A = Eigen::MatrixXd::Zero(2 * num_eqs, 2 * N);
+        for (int k = 0; k < num_eqs; ++k) {
+            double sign = 1.0;
+            for (int i = 0; i < N; ++i) {
+                int j_idx = k - i;
+                if (j_idx >= 0 && j_idx <= q_deg) {
+                    Complex qp_j = q_para.coefficients[j_idx];
+                    Complex q_j = st.q_poly.coefficients[j_idx];
+                    A(2*k,   2*i)   += qp_j.real() + sign * q_j.real();
+                    A(2*k,   2*i+1) += -qp_j.imag() + sign * q_j.imag();
+                    A(2*k+1, 2*i)   += qp_j.imag() + sign * q_j.imag();
+                    A(2*k+1, 2*i+1) += qp_j.real() - sign * q_j.real();
+                }
+                sign = -sign;
+            }
+        }
+        auto qr = A.colPivHouseholderQr();
+
+        for (int v = 0; v < num_vars; ++v) {
+            int coeff_idx = v + 1;
+            int deg = N - 1 - coeff_idx;
+            st.dp_degrees[v] = deg;
+
+            std::vector<Complex> dp_c(deg + 1, Complex(0));
+            dp_c[deg] = Complex(1);
+            Polynomial<Complex> dp(dp_c);
+            auto rhs_poly = dp * p_para + st.p_poly * dp.para_conjugate();
+
+            int rhs_deg = rhs_poly.degree();
+            Eigen::VectorXd b = Eigen::VectorXd::Zero(2 * num_eqs);
+            for (int k = 0; k < num_eqs; ++k) {
+                Complex rc = (k <= rhs_deg) ? rhs_poly.coefficients[k] : Complex(0);
+                b(2 * k) = rc.real();
+                b(2 * k + 1) = rc.imag();
+            }
+
+            Eigen::VectorXd sol = qr.solve(b);
+            std::vector<Complex> dq_c(N);
+            for (int i = 0; i < N; ++i)
+                dq_c[i] = Complex(sol(2*i), sol(2*i+1));
+
+            if (N > 0 && N <= static_cast<int>(st.q_poly.coefficients.size())) {
+                double denom = st.q_poly.coefficients[N - 1].real();
+                if (std::abs(denom) > 1e-15) {
+                    double beta = dq_c[N - 1].imag() / denom;
+                    for (int i = 0; i < N && i < static_cast<int>(st.q_poly.coefficients.size()); ++i)
+                        dq_c[i] -= Complex(0, 1) * beta * st.q_poly.coefficients[i];
+                }
+            }
+            st.dq_polys[v] = Polynomial<Complex>(dq_c);
+        }
+    }
+
+    return st;
+}
+
+} // anonymous namespace
 
 MultiplexerNevanlinnaPick::~MultiplexerNevanlinnaPick() = default;
 
@@ -338,18 +508,49 @@ int MultiplexerNevanlinnaPick::get_num_variables() {
 VectorXcd MultiplexerNevanlinnaPick::compute_residual(
     const VectorXcd& x, double lambda) const
 {
-    // F_i,m(P, lambda) = f(p_i)[xi_m] - L_i(P, lambda)[xi_m]
-    // Martinez: f(p_i) = L_i (direct equality, no conjugate)
     auto all_p = split_variables(x);
+
+    // Factor each channel once (N feldtkeller calls total)
+    std::vector<ChannelPolyState> polys(num_channels_);
+    for (int k = 0; k < num_channels_; ++k)
+        polys[k] = build_poly_state(all_p[k], channels_[k].r_coeffs,
+                                     channels_[k].num_vars, false);
+
     VectorXcd F(total_eqs_);
 
     for (int i = 0; i < num_channels_; ++i) {
         auto& ch = channels_[i];
-        VectorXcd fi = eval_channel_map(i, all_p[i]);
-
         for (int m = 0; m < ch.order; ++m) {
-            Complex L_i = eval_coupled_load(i, ch.interp_freqs[m], lambda, all_p);
-            F(ch.eq_offset + m) = fi(m) - L_i;
+            Complex s_i(0, ch.norm_freqs[m]);
+            Complex fi = polys[i].eval_f(s_i);
+
+            double freq_phys = ch.interp_freqs[m];
+            auto J = manifold_->compute_J(freq_phys);
+            Complex J_ii = J(i + 1, i + 1);
+
+            Complex Li;
+            if (std::abs(lambda) < 1e-15 || num_channels_ < 2) {
+                Li = J_ii;
+            } else {
+                VectorXcd vi = manifold_->compute_Vi(J, i);
+                MatrixXcd wi = manifold_->compute_Wi(J, i);
+                int dim = num_channels_ - 1;
+                MatrixXcd Fi_mat = MatrixXcd::Zero(dim, dim);
+                int col = 0;
+                for (int k = 0; k < num_channels_; ++k) {
+                    if (k == i) continue;
+                    double nf = (freq_phys - channels_[k].freq_center)
+                              / channels_[k].freq_scale;
+                    Fi_mat(col, col) = polys[k].eval_f(Complex(0, nf));
+                    col++;
+                }
+                MatrixXcd I_dim = MatrixXcd::Identity(dim, dim);
+                Complex coupling = (vi.adjoint() * (I_dim - Fi_mat * wi).inverse()
+                                    * Fi_mat * vi)(0, 0);
+                Li = J_ii + lambda * coupling;
+            }
+
+            F(ch.eq_offset + m) = fi - Li;
         }
     }
     return F;
@@ -358,61 +559,27 @@ VectorXcd MultiplexerNevanlinnaPick::compute_residual(
 MatrixXcd MultiplexerNevanlinnaPick::compute_jacobian_dp(
     const VectorXcd& x, double lambda) const
 {
-    // Analytical Jacobian following the C# implementation:
-    // J = dMatch/dp - lambda * conj(dG/dp)
-    //
-    // Diagonal blocks: dMatch_i/dp_i = d(f(p_i))/dp_i  (Bezout-based gradient)
-    // Off-diagonal: -lambda * conj(dL_i/dp_j)
-    //   where dL_i/dp_j = v^T · S · dF/dp_j · (W·S·F + I) · v
-    //   S = (I - F·W)^{-1}
-
     auto all_p = split_variables(x);
+
+    // Precompute polynomials and Bezout derivatives for all channels (N feldtkeller + N Bezout solves)
+    std::vector<ChannelPolyState> polys(num_channels_);
+    for (int k = 0; k < num_channels_; ++k)
+        polys[k] = build_poly_state(all_p[k], channels_[k].r_coeffs,
+                                     channels_[k].num_vars, true);
+
     MatrixXcd Jac = MatrixXcd::Zero(total_eqs_, total_vars_);
 
-    // Precompute per-channel gradients: d(f(p_k))/dp_k at ALL frequencies
-    // grads[k] is (total_freq_count x (order_k + 1)) — gradient of p_k/q_k
-    // We need gradients evaluated at OTHER channels' frequencies too.
-    struct ChannelGradInfo {
-        // Per-channel f(p_k) and df/dp_k at each frequency across all channels
-        std::vector<Complex> f_vals;          // f(p_k) at each freq
-        std::vector<VectorXcd> df_dp_vals;    // df/dp_k at each freq (size num_vars_k)
-    };
-
-    // For each channel k, evaluate f(p_k) and df/dp_k at all required frequencies
-    std::vector<ChannelGradInfo> grad_info(num_channels_);
-
-    for (int k = 0; k < num_channels_; ++k) {
-        auto& ch_k = channels_[k];
-        auto r_poly = build_polynomial(ch_k.r_coeffs);
-        auto p_poly = build_polynomial(all_p[k]);
-        auto q_poly = SpectralFactor::feldtkeller(p_poly, r_poly);
-
-        // Collect all unique physical frequencies where we need channel k evaluated
-        // (from all other channels' interpolation frequencies, plus own)
-        // For simplicity, evaluate at each channel i's frequencies
-        for (int i = 0; i < num_channels_; ++i) {
-            auto& ch_i = channels_[i];
-            for (int m = 0; m < ch_i.order; ++m) {
-                double phys_freq = ch_i.interp_freqs[m];
-                double norm_freq_k = (phys_freq - ch_k.freq_center) / ch_k.freq_scale;
-                Complex s(0, norm_freq_k);
-                Complex p_val = p_poly.evaluate(s);
-                Complex q_val = q_poly.evaluate(s);
-                Complex f_val = (std::abs(q_val) > 1e-15) ? p_val / q_val : Complex(0);
-                grad_info[k].f_vals.push_back(f_val);
-            }
+    // Diagonal blocks: df(p_i)/dp_i at channel i's own interpolation frequencies
+    for (int i = 0; i < num_channels_; ++i) {
+        auto& ch_i = channels_[i];
+        for (int m = 0; m < ch_i.order; ++m) {
+            Complex s(0, ch_i.norm_freqs[m]);
+            for (int v = 0; v < ch_i.num_vars; ++v)
+                Jac(ch_i.eq_offset + m, ch_i.var_offset + v) = polys[i].eval_df(v, s);
         }
     }
 
-    // Diagonal blocks: dMatch_i/dp_i
-    for (int i = 0; i < num_channels_; ++i) {
-        auto& ch_i = channels_[i];
-        MatrixXcd full_grad = eval_channel_grad(i, all_p[i]);
-        Jac.block(ch_i.eq_offset, ch_i.var_offset,
-                  ch_i.order, ch_i.num_vars) = full_grad.rightCols(ch_i.num_vars);
-    }
-
-    // Off-diagonal blocks: analytical dG/dp
+    // Off-diagonal blocks: -lambda * conj(dL_i/dp_j)
     if (std::abs(lambda) > 1e-15) {
         for (int i = 0; i < num_channels_; ++i) {
             auto& ch_i = channels_[i];
@@ -426,83 +593,44 @@ MatrixXcd MultiplexerNevanlinnaPick::compute_jacobian_dp(
                 int dim = num_channels_ - 1;
                 MatrixXcd Fi = MatrixXcd::Zero(dim, dim);
 
-                // Build F_i diagonal matrix
                 int col = 0;
                 for (int k = 0; k < num_channels_; ++k) {
                     if (k == i) continue;
-                    double norm_freq_k = (phys_freq - channels_[k].freq_center) / channels_[k].freq_scale;
-                    auto r_poly = build_polynomial(channels_[k].r_coeffs);
-                    auto p_poly = build_polynomial(all_p[k]);
-                    auto q_poly = SpectralFactor::feldtkeller(p_poly, r_poly);
-                    Complex s(0, norm_freq_k);
-                    Complex q_val = q_poly.evaluate(s);
-                    Fi(col, col) = (std::abs(q_val) > 1e-15)
-                        ? p_poly.evaluate(s) / q_val : Complex(0);
+                    double nf = (phys_freq - channels_[k].freq_center)
+                              / channels_[k].freq_scale;
+                    Fi(col, col) = polys[k].eval_f(Complex(0, nf));
                     col++;
                 }
 
-                // S = (I - F·W)^{-1}
                 MatrixXcd I_dim = MatrixXcd::Identity(dim, dim);
                 MatrixXcd S = (I_dim - Fi * wi).inverse();
+                MatrixXcd WSF_I = wi * S * Fi + I_dim;
 
-                // For each channel j != i, compute dL_i/dp_j
                 for (int j = 0; j < num_channels_; ++j) {
                     if (j == i) continue;
                     auto& ch_j = channels_[j];
 
-                    // Index of channel j within the F_i matrix (excluding channel i)
                     int j_in_Fi = 0;
-                    for (int kk = 0; kk < j; ++kk) {
+                    for (int kk = 0; kk < j; ++kk)
                         if (kk != i) j_in_Fi++;
-                    }
 
-                    // Compute per-channel gradient df_j/dp_j at this frequency
-                    double norm_freq_j = (phys_freq - ch_j.freq_center) / ch_j.freq_scale;
-
-                    // We need df_j/dp_j_coeff for each free coefficient of channel j
-                    // eval_channel_grad gives gradient at channel j's own interp freqs,
-                    // but we need it at channel i's frequency. Compute directly.
-                    auto r_poly_j = build_polynomial(ch_j.r_coeffs);
-                    auto p_poly_j = build_polynomial(all_p[j]);
-                    auto q_poly_j = SpectralFactor::feldtkeller(p_poly_j, r_poly_j);
-
+                    double norm_freq_j = (phys_freq - ch_j.freq_center)
+                                       / ch_j.freq_scale;
                     Complex s_j(0, norm_freq_j);
-                    Complex p_val_j = p_poly_j.evaluate(s_j);
-                    Complex q_val_j = q_poly_j.evaluate(s_j);
 
-                    int N_j = static_cast<int>(all_p[j].size());
+                    // Precompute coupling vectors for rank-1 update
+                    // dL = (v^H S)_{j_in_Fi} * df * (WSF_I v)_{j_in_Fi}
+                    VectorXcd vHS = S.adjoint() * vi;      // S^H v
+                    VectorXcd WSF_Iv = WSF_I * vi;
+
+                    Complex left  = std::conj(vHS(j_in_Fi));  // (v^H S)_{j_in_Fi}
+                    Complex right = WSF_Iv(j_in_Fi);
 
                     for (int v = 0; v < ch_j.num_vars; ++v) {
-                        // df_j/dp_j[v]: derivative of f_j = p_j/q_j w.r.t. the v-th
-                        // free coefficient (v+1 in monic indexing, degree N_j-1-(v+1))
-                        int coeff_idx = v + 1;  // skip leading 1
-                        int deg = N_j - 1 - coeff_idx;
-
-                        // dp/dp_v = s^deg (monomial)
-                        Complex dp_val = std::pow(s_j, deg);
-
-                        // dq/dp_v: solve Bezout for this single perturbation
-                        // For efficiency, use the quotient rule approximation:
-                        // df/dp_v ≈ (dp_val * q - p * dq_val) / q^2
-                        // We need dq_val. Use FD on the spectral factor.
-                        auto p_pert_coeffs = all_p[j];
-                        p_pert_coeffs(coeff_idx) += 1e-7;
-                        auto p_pert_poly = build_polynomial(p_pert_coeffs);
-                        auto q_pert_poly = SpectralFactor::feldtkeller(p_pert_poly, r_poly_j);
-                        Complex dq_val = (q_pert_poly.evaluate(s_j) - q_val_j) / 1e-7;
-
-                        Complex df_j_dpv = (dp_val * q_val_j - p_val_j * dq_val)
-                                         / (q_val_j * q_val_j);
-
-                        // dF/dp_j[v]: diagonal matrix with df_j_dpv at position (j_in_Fi, j_in_Fi)
-                        MatrixXcd dF = MatrixXcd::Zero(dim, dim);
-                        dF(j_in_Fi, j_in_Fi) = df_j_dpv;
-
-                        // dL_i/dp_j[v] = v^T · S · dF · (W·S·F + I) · v
-                        MatrixXcd WSF_I = wi * S * Fi + I_dim;
-                        Complex dL = (vi.adjoint() * S * dF * WSF_I * vi)(0, 0);
-
-                        Jac(ch_i.eq_offset + m, ch_j.var_offset + v) = -lambda * std::conj(dL);
+                        Complex df_j_dpv = polys[j].eval_df(v, s_j);
+                        Complex dL = left * df_j_dpv * right;
+                        Jac(ch_i.eq_offset + m, ch_j.var_offset + v) =
+                            -lambda * std::conj(dL);
                     }
                 }
             }
@@ -515,17 +643,36 @@ MatrixXcd MultiplexerNevanlinnaPick::compute_jacobian_dp(
 VectorXcd MultiplexerNevanlinnaPick::compute_dF_dlambda(
     const VectorXcd& x, double lambda) const
 {
-    // dF/dlambda = -dL_i/dlambda = -(coupling_term_i)
     auto all_p = split_variables(x);
+
+    std::vector<ChannelPolyState> polys(num_channels_);
+    for (int k = 0; k < num_channels_; ++k)
+        polys[k] = build_poly_state(all_p[k], channels_[k].r_coeffs,
+                                     channels_[k].num_vars, false);
+
     VectorXcd dFdl(total_eqs_);
 
     for (int i = 0; i < num_channels_; ++i) {
         auto& ch = channels_[i];
         for (int m = 0; m < ch.order; ++m) {
-            Complex L_full = eval_coupled_load(i, ch.interp_freqs[m], 1.0, all_p);
-            auto J_mat = manifold_->compute_J(ch.interp_freqs[m]);
-            Complex J_ii = J_mat(i + 1, i + 1);
-            dFdl(ch.eq_offset + m) = -(L_full - J_ii);
+            double freq_phys = ch.interp_freqs[m];
+            auto J = manifold_->compute_J(freq_phys);
+            VectorXcd vi = manifold_->compute_Vi(J, i);
+            MatrixXcd wi = manifold_->compute_Wi(J, i);
+            int dim = num_channels_ - 1;
+            MatrixXcd Fi_mat = MatrixXcd::Zero(dim, dim);
+            int col = 0;
+            for (int k = 0; k < num_channels_; ++k) {
+                if (k == i) continue;
+                double nf = (freq_phys - channels_[k].freq_center)
+                          / channels_[k].freq_scale;
+                Fi_mat(col, col) = polys[k].eval_f(Complex(0, nf));
+                col++;
+            }
+            MatrixXcd I_dim = MatrixXcd::Identity(dim, dim);
+            Complex coupling = (vi.adjoint() * (I_dim - Fi_mat * wi).inverse()
+                                * Fi_mat * vi)(0, 0);
+            dFdl(ch.eq_offset + m) = -coupling;
         }
     }
     return dFdl;
@@ -538,20 +685,33 @@ bool MultiplexerNevanlinnaPick::run_continuation(
     double lambda = 0.0;
     double h = lambda_step;
 
+    std::ofstream path_log("continuation_path.csv");
+    path_log << "step,lambda,h,residual,newton_iters,dx_norm,x_norm,predictor_res\n";
+
     for (int step = 0; step < max_steps && lambda < 1.0 - 1e-12; ++step) {
-        // Clamp to not overshoot
         if (lambda + h > 1.0) h = 1.0 - lambda;
 
-        // Euler predictor: dx = -(dF/dp)^{-1} * (dF/dlambda) * h
+        // Compute Jacobian and dF/dlambda at current point (once per step)
         MatrixXcd Jp = compute_jacobian_dp(x, lambda);
         VectorXcd dFdl = compute_dF_dlambda(x, lambda);
-        VectorXcd dx = Jp.colPivHouseholderQr().solve(-dFdl * h);
 
+        // QR factorize once — reused for predictor and all Newton iterations
+        auto Jp_qr = Jp.colPivHouseholderQr();
+
+        // Euler predictor
+        VectorXcd dx = Jp_qr.solve(-dFdl * h);
         VectorXcd x_pred = x + dx;
         double new_lambda = lambda + h;
 
-        // Damped Newton corrector at new lambda
+        double predictor_res = compute_residual(x_pred, new_lambda).norm();
+
+        // Modified Newton: Jacobian at predicted point, reused for all iterations
+        MatrixXcd Jp_corr = compute_jacobian_dp(x_pred, new_lambda);
+        auto Jp_corr_qr = Jp_corr.colPivHouseholderQr();
+
         bool converged = false;
+        int newton_iters = 0;
+        bool refreshed = false;
         for (int iter = 0; iter < newton_max_iter; ++iter) {
             VectorXcd F = compute_residual(x_pred, new_lambda);
             double res = F.norm();
@@ -562,54 +722,73 @@ bool MultiplexerNevanlinnaPick::run_continuation(
 
             if (res < newton_tol) {
                 converged = true;
+                newton_iters = iter + 1;
                 break;
             }
 
-            MatrixXcd Jp_new = compute_jacobian_dp(x_pred, new_lambda);
-            VectorXcd correction = Jp_new.colPivHouseholderQr().solve(-F);
+            VectorXcd correction = Jp_corr_qr.solve(-F);
 
-            // Backtracking line search
             double alpha = 1.0;
+            bool stepped = false;
             for (int ls = 0; ls < 10; ++ls) {
                 VectorXcd x_try = x_pred + alpha * correction;
                 double res_try = compute_residual(x_try, new_lambda).norm();
                 if (res_try < res) {
                     x_pred = x_try;
+                    stepped = true;
                     break;
                 }
                 alpha *= 0.5;
             }
 
-            if (alpha < 1e-8) break;
+            if (!stepped || alpha < 1e-8) {
+                if (!refreshed) {
+                    Jp_corr = compute_jacobian_dp(x_pred, new_lambda);
+                    Jp_corr_qr = Jp_corr.colPivHouseholderQr();
+                    refreshed = true;
+                    continue;
+                }
+                break;
+            }
+            newton_iters = iter + 1;
         }
 
         if (converged) {
+            double dx_norm = (x_pred - x).norm();
             x = x_pred;
             lambda = new_lambda;
+
+            path_log << step << "," << lambda << "," << h << ","
+                     << compute_residual(x, lambda).norm() << ","
+                     << newton_iters << "," << dx_norm << ","
+                     << x.norm() << "," << predictor_res << "\n";
 
             if (verbose && (step % 20 == 0 || lambda >= 1.0 - 1e-12)) {
                 VectorXcd F = compute_residual(x, lambda);
                 std::cout << "    lambda=" << std::fixed << std::setprecision(4) << lambda
                           << " residual=" << std::scientific << std::setprecision(2)
-                          << F.norm() << " h=" << h << "\n";
+                          << F.norm() << " h=" << h
+                          << " newton=" << newton_iters << "\n";
             }
 
-            h = std::min(h * 1.5, 0.1);
+            // Adaptive step: grow faster when Newton converges quickly
+            if (newton_iters <= 3)
+                h = std::min(h * 2.0, 0.1);
+            else
+                h = std::min(h * 1.5, 0.1);
         } else {
             h *= 0.5;
             if (h < 1e-12) {
                 if (verbose) {
-                    // Show what's happening at the stall point
                     VectorXcd F = compute_residual(x, lambda);
                     std::cout << "    Stalled at lambda=" << std::fixed << std::setprecision(6)
                               << lambda << " residual=" << F.norm() << " h=" << h << "\n";
-                    VectorXcd F_test = compute_residual(x, lambda + 0.001);
-                    std::cout << "    Residual at lambda+" << 0.001 << ": " << F_test.norm() << "\n";
                 }
                 return false;
             }
         }
     }
+    path_log.close();
 
     return lambda >= 1.0 - 1e-12;
 }
@@ -636,6 +815,134 @@ std::vector<MatrixXcd> MultiplexerNevanlinnaPick::extract_coupling_matrices(
     }
 
     return cms;
+}
+
+bool MultiplexerNevanlinnaPick::shift_frequencies(
+    VectorXcd& x,
+    const std::vector<std::vector<double>>& target_freqs,
+    double step, int max_steps, int newton_max, double newton_tol, bool verbose)
+{
+    // Save original frequencies
+    std::vector<std::vector<double>> orig_phys(num_channels_);
+    std::vector<std::vector<double>> orig_norm(num_channels_);
+    for (int i = 0; i < num_channels_; ++i) {
+        orig_phys[i] = channels_[i].interp_freqs;
+        orig_norm[i].assign(channels_[i].norm_freqs.begin(), channels_[i].norm_freqs.end());
+    }
+
+    double lambda = 0.0;
+    double h = step;
+
+    for (int s = 0; s < max_steps && lambda < 1.0 - 1e-12; ++s) {
+        if (lambda + h > 1.0) h = 1.0 - lambda;
+
+        double new_lambda = lambda + h;
+
+        // Blend frequencies: xi(lambda) = (1-lambda)*orig + lambda*target
+        auto set_blended = [&](double lam) {
+            for (int i = 0; i < num_channels_; ++i) {
+                for (int m = 0; m < channels_[i].order; ++m) {
+                    channels_[i].interp_freqs[m] =
+                        (1.0 - lam) * orig_phys[i][m] + lam * target_freqs[i][m];
+                    channels_[i].norm_freqs[m] =
+                        (channels_[i].interp_freqs[m] - channels_[i].freq_center)
+                        / channels_[i].freq_scale;
+                }
+            }
+        };
+
+        // Euler predictor: dx = -(dF/dp)^{-1} * (dF/dlambda_freq) * h
+        // dF/dlambda_freq is computed by FD on the blended residual
+        // Analytical dF/dlambda: since xi(lambda) = (1-lambda)*orig + lambda*target,
+        // dxi/dlambda = target - orig.  dF/dlambda = dF/dxi * dxi/dlambda.
+        // dF_{i,m}/dxi_{i,m} is the frequency derivative of [f(p_i) - L_i] at xi_{i,m}.
+        // This is a diagonal contribution (each equation depends on one frequency).
+
+        set_blended(lambda);
+        auto all_p = split_variables(x);
+        VectorXcd dFdl(total_eqs_);
+
+        for (int i = 0; i < num_channels_; ++i) {
+            auto& ch = channels_[i];
+            auto r_poly = build_polynomial(ch.r_coeffs);
+            auto p_poly = build_polynomial(all_p[i]);
+            auto q_poly = SpectralFactor::feldtkeller(p_poly, r_poly);
+
+            for (int m = 0; m < ch.order; ++m) {
+                double dxi = target_freqs[i][m] - orig_phys[i][m];  // dxi/dlambda
+                double phys_f = ch.interp_freqs[m];
+                double norm_f = ch.norm_freqs[m];
+
+                // df/dxi: derivative of f(p_i) = p/q w.r.t. physical frequency
+                // s = j * norm_freq, ds/dxi = j / freq_scale
+                Complex s(0, norm_f);
+                Complex p_val = p_poly.evaluate(s);
+                Complex q_val = q_poly.evaluate(s);
+                Complex p_deriv = p_poly.derivative().evaluate(s);
+                Complex q_deriv = q_poly.derivative().evaluate(s);
+                Complex ds_dxi = Complex(0, 1.0 / ch.freq_scale);
+                Complex df_dxi = ((p_deriv * q_val - p_val * q_deriv)
+                                 / (q_val * q_val)) * ds_dxi;
+
+                // dL_i/dxi: derivative of coupled load w.r.t. frequency
+                // Compute via central FD on eval_coupled_load (small, cheap)
+                double delta = 1e-6 * ch.freq_scale;
+                Complex L_plus = eval_coupled_load(i, phys_f + delta, 1.0, all_p);
+                Complex L_minus = eval_coupled_load(i, phys_f - delta, 1.0, all_p);
+                Complex dL_dxi = (L_plus - L_minus) / (2.0 * delta);
+
+                dFdl(ch.eq_offset + m) = (df_dxi - dL_dxi) * dxi;
+            }
+        }
+
+        MatrixXcd Jp = compute_jacobian_dp(x, 1.0);
+        VectorXcd dx = Jp.colPivHouseholderQr().solve(-dFdl * h);
+
+        VectorXcd x_pred = x + dx;
+
+        // Newton corrector at blended frequencies
+        set_blended(new_lambda);
+        bool converged = false;
+        for (int iter = 0; iter < newton_max; ++iter) {
+            VectorXcd F = compute_residual(x_pred, 1.0);
+            double res = F.norm();
+            if (res < newton_tol) { converged = true; break; }
+
+            MatrixXcd Jp_new = compute_jacobian_dp(x_pred, 1.0);
+            VectorXcd corr = Jp_new.colPivHouseholderQr().solve(-F);
+
+            // Backtracking
+            double alpha = 1.0;
+            for (int ls = 0; ls < 8; ++ls) {
+                VectorXcd x_try = x_pred + alpha * corr;
+                double res_try = compute_residual(x_try, 1.0).norm();
+                if (res_try < res) { x_pred = x_try; break; }
+                alpha *= 0.5;
+            }
+        }
+
+        if (converged) {
+            x = x_pred;
+            lambda = new_lambda;
+            h = std::min(h * 1.5, 0.5);
+
+            if (verbose) {
+                VectorXcd F = compute_residual(x, 1.0);
+                std::cout << "    freq_shift lambda=" << std::fixed << std::setprecision(3)
+                          << lambda << " res=" << std::scientific << std::setprecision(1)
+                          << F.norm() << "\n";
+            }
+        } else {
+            h *= 0.5;
+            set_blended(lambda);  // revert frequencies
+            if (h < 1e-10) {
+                if (verbose) std::cout << "    freq_shift stalled at lambda=" << lambda << "\n";
+                return false;
+            }
+        }
+    }
+
+    return lambda >= 1.0 - 1e-12;
 }
 
 } // namespace np
