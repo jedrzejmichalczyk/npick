@@ -22,6 +22,10 @@ set(LIB_SOURCES
     ../src/path_tracker.cpp
     ../src/dopr853_predictor.cpp
     ../src/corrector.cpp
+    ../src/t_junction.cpp
+    ../src/manifold.cpp
+    ../src/multiplexer_np.cpp
+    ../src/multiplexer_matching.cpp
 )
 
 add_executable(npick ${LIB_SOURCES} npick_bindings.cpp)

@@ -16,7 +16,23 @@ header {
     gap: 1rem;
 }
 header h1 { font-size: 1.3rem; font-weight: 600; }
-header span { font-size: 0.85rem; opacity: 0.6; }
+header span { font-size: 0.85rem; opacity: 0.6; flex: 1; }
+header .gh-link {
+    color: rgba(255,255,255,0.6);
+    transition: color 0.15s;
+    display: flex;
+    align-items: center;
+}
+header .gh-link:hover { color: #fff; }
+
+footer {
+    text-align: center;
+    padding: 1rem;
+    font-size: 0.78rem;
+    color: #888;
+}
+footer a { color: #4361ee; text-decoration: none; }
+footer a:hover { text-decoration: underline; }
 
 .container {
     max-width: 1600px;
@@ -243,6 +259,216 @@ header span { font-size: 0.85rem; opacity: 0.6; }
 #status.running { color: #e67e22; }
 #status.error { color: #e74c3c; }
 
+/* Mode bar (tab switcher below header) */
+.mode-bar {
+    max-width: 1600px;
+    margin: 0 auto;
+    padding: 0.5rem 1rem 0;
+    display: flex;
+    gap: 0.3rem;
+    border-bottom: 1px solid #e3e7ee;
+}
+.mode-tab {
+    background: transparent;
+    border: 1px solid transparent;
+    border-bottom: none;
+    padding: 0.45rem 1rem;
+    font-size: 0.85rem;
+    font-weight: 500;
+    color: #666;
+    cursor: pointer;
+    border-radius: 6px 6px 0 0;
+    transition: background 0.15s, color 0.15s;
+}
+.mode-tab:hover { color: #1a1a2e; background: rgba(67,97,238,0.05); }
+.mode-tab.active {
+    background: #fff;
+    color: #1a1a2e;
+    border-color: #e3e7ee;
+    border-bottom-color: #fff;
+    margin-bottom: -1px;
+    font-weight: 600;
+}
+
+/* Multiplexer preset row */
+.preset-row {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 0.5rem;
+}
+.btn-preset {
+    padding: 0.55rem 0.4rem;
+    background: #f3f5fa;
+    color: #1a1a2e;
+    border: 1px solid #dde3ec;
+    border-radius: 6px;
+    font-size: 0.82rem;
+    font-weight: 600;
+    cursor: pointer;
+    line-height: 1.15;
+    transition: background 0.15s, border-color 0.15s;
+}
+.btn-preset small {
+    display: block;
+    font-size: 0.68rem;
+    font-weight: 400;
+    color: #888;
+    margin-top: 0.15rem;
+}
+.btn-preset:hover { background: #e9eef8; border-color: #c7d0e4; }
+
+/* Channel list */
+.channel-row {
+    display: grid;
+    grid-template-columns: 20px 1fr 1fr 1fr 1fr 20px;
+    gap: 0.35rem;
+    align-items: end;
+    padding: 0.45rem 0;
+    border-bottom: 1px dashed #eef1f6;
+}
+.channel-row:last-child { border-bottom: none; }
+.channel-row .ch-label {
+    font-size: 0.75rem;
+    font-weight: 600;
+    color: #888;
+    text-align: center;
+    padding-bottom: 0.4rem;
+}
+.channel-row .form-group { margin-bottom: 0; }
+.channel-row .form-group input {
+    font-size: 0.78rem;
+    padding: 0.28rem 0.4rem;
+}
+.channel-row .form-group label {
+    font-size: 0.65rem;
+    text-transform: uppercase;
+    letter-spacing: 0.02em;
+}
+.channel-row .ch-remove {
+    border: none;
+    background: transparent;
+    color: #c0c6d1;
+    cursor: pointer;
+    font-size: 1.1rem;
+    padding: 0 0.1rem;
+    align-self: center;
+    margin-bottom: 0.4rem;
+}
+.channel-row .ch-remove:hover { color: #e74c3c; }
+.channel-row.header {
+    padding: 0.3rem 0 0.2rem;
+    border-bottom: 1px solid #dde3ec;
+}
+.channel-row.header > div {
+    font-size: 0.65rem;
+    color: #999;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    padding-bottom: 0;
+    font-weight: 600;
+    text-align: center;
+}
+.channel-controls { margin-top: 0.5rem; }
+.btn-icon {
+    background: transparent;
+    color: #4361ee;
+    border: 1px dashed #b5c1df;
+    padding: 0.4rem;
+    width: 100%;
+    font-size: 0.78rem;
+    font-weight: 500;
+    border-radius: 4px;
+    cursor: pointer;
+    transition: background 0.15s;
+}
+.btn-icon:hover { background: #f0f4ff; }
+
+/* T-junction alpha inputs */
+#junctionAlphaGroup {
+    display: grid;
+    gap: 0.35rem;
+    margin-top: 0.4rem;
+}
+.alpha-row {
+    display: grid;
+    grid-template-columns: 60px 1fr;
+    gap: 0.4rem;
+    align-items: center;
+}
+.alpha-row label {
+    font-size: 0.75rem;
+    color: #666;
+    font-weight: 500;
+}
+.alpha-row input {
+    padding: 0.28rem 0.4rem;
+    font-size: 0.78rem;
+    border: 1px solid #d1d9e6;
+    border-radius: 4px;
+}
+
+/* Compact drop zone for junction files */
+.drop-zone.compact {
+    padding: 0.7rem 0.5rem;
+}
+.drop-zone.compact p { font-size: 0.72rem; }
+
+#muxStatus {
+    font-size: 0.78rem;
+    color: #888;
+    margin-top: 0.4rem;
+    min-height: 1.2em;
+}
+#muxStatus.running { color: #e67e22; }
+#muxStatus.error { color: #e74c3c; }
+
+/* Coupling-matrix tab row (per-channel in multiplexer mode) */
+.cm-tab-row {
+    display: flex;
+    gap: 0.35rem;
+    margin-bottom: 0.6rem;
+    flex-wrap: wrap;
+}
+.cm-tab {
+    background: #f3f5fa;
+    color: #666;
+    border: 1px solid #dde3ec;
+    padding: 0.3rem 0.7rem;
+    font-size: 0.78rem;
+    font-weight: 500;
+    border-radius: 4px;
+    cursor: pointer;
+}
+.cm-tab.active {
+    background: #4361ee;
+    color: #fff;
+    border-color: #4361ee;
+}
+
+/* Channel summary badges in multiplexer results */
+.channel-summary {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.4rem;
+    margin-top: 0.3rem;
+}
+.channel-summary .ch-badge {
+    font-size: 0.75rem;
+    padding: 0.22rem 0.6rem;
+    border-radius: 4px;
+    background: #f0f4ff;
+    color: #1a1a2e;
+    font-weight: 500;
+}
+.channel-summary .ch-badge .ch-color {
+    display: inline-block;
+    width: 9px;
+    height: 9px;
+    border-radius: 50%;
+    margin-right: 0.4rem;
+    vertical-align: middle;
+}
+
 /* Responsive */
 @media (max-width: 900px) {
     .container {
@@ -251,5 +477,12 @@ header span { font-size: 0.85rem; opacity: 0.6; }
     }
     .plot-area {
         min-height: 350px;
+    }
+    .channel-row {
+        grid-template-columns: 20px 1fr 1fr 20px;
+    }
+    .channel-row .ch-order,
+    .channel-row .ch-rl {
+        grid-column: span 1;
     }
 }

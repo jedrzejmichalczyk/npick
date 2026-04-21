@@ -3,21 +3,19 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>npick — Broadband Impedance Matching Solver (Nevanlinna-Pick)</title>
-    <meta name="description" content="Free browser-based broadband impedance matching network solver using Nevanlinna-Pick interpolation. Upload Touchstone S-parameter files and compute optimal coupling matrices instantly via WebAssembly.">
-    <meta name="keywords" content="impedance matching, Nevanlinna-Pick interpolation, RF filter design, coupling matrix, S-parameter, Touchstone, broadband matching, microwave engineering, WebAssembly solver">
+    <title>npick — Impedance Matching & Multiplexer Synthesis (Nevanlinna-Pick)</title>
+    <meta name="description" content="Free browser-based broadband impedance matching and manifold-coupled multiplexer synthesis via Nevanlinna-Pick interpolation. Upload Touchstone files or use built-in demos.">
+    <meta name="keywords" content="impedance matching, Nevanlinna-Pick interpolation, multiplexer synthesis, manifold-coupled multiplexer, RF filter design, coupling matrix, S-parameter, Touchstone, broadband matching, microwave engineering, WebAssembly solver, Martinez 2019">
     <meta name="author" content="Jedrzej Michalczyk">
 
-    <!-- Open Graph (Facebook, LinkedIn, etc.) -->
-    <meta property="og:title" content="npick — Broadband Impedance Matching Solver">
-    <meta property="og:description" content="Free browser-based impedance matching network solver using Nevanlinna-Pick interpolation. Upload S-parameter files and get optimal coupling matrices instantly.">
+    <meta property="og:title" content="npick — Impedance Matching & Multiplexer Synthesis">
+    <meta property="og:description" content="Free browser-based Nevanlinna-Pick solver for impedance matching and manifold-coupled multiplexer synthesis. Upload S-parameter files or use built-in demos.">
     <meta property="og:type" content="website">
     <meta property="og:url" content="https://jedrzejmichalczyk.github.io/npick/">
 
-    <!-- Twitter Card -->
     <meta name="twitter:card" content="summary">
-    <meta name="twitter:title" content="npick — Broadband Impedance Matching Solver">
-    <meta name="twitter:description" content="Free browser-based impedance matching solver using Nevanlinna-Pick interpolation. Upload Touchstone files and compute coupling matrices via WebAssembly.">
+    <meta name="twitter:title" content="npick — Impedance Matching & Multiplexer Synthesis">
+    <meta name="twitter:description" content="Nevanlinna-Pick solver for impedance matching and multiplexer synthesis. Runs in the browser via WebAssembly.">
 
     <link rel="canonical" href="https://jedrzejmichalczyk.github.io/npick/">
     <link rel="stylesheet" href="style.css">
@@ -27,95 +25,159 @@
 
 <header>
     <h1>npick</h1>
-    <span>Broadband impedance matching via Nevanlinna-Pick interpolation</span>
+    <span>Nevanlinna-Pick solver for broadband matching &amp; multiplexers</span>
     <a href="https://github.com/jedrzejmichalczyk/npick" class="gh-link" title="View source on GitHub">
         <svg height="20" width="20" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
     </a>
 </header>
 
+<div class="mode-bar">
+    <button class="mode-tab active" data-mode="impedance">Impedance Matching</button>
+    <button class="mode-tab" data-mode="multiplexer">Multiplexer Synthesis</button>
+</div>
+
 <div class="container">
     <!-- Left panel: controls -->
     <div class="sidebar">
-        <div class="panel">
-            <h2>Load Data</h2>
-
-            <div class="drop-zone" id="dropZone">
-                <p>Drop S-parameter file here<br>or click to browse</p>
-                <div class="formats">.s1p .s2p .csv</div>
-                <input type="file" id="fileInput" accept=".s1p,.s2p,.csv,.txt">
+        <!-- Impedance matching mode -->
+        <div id="impedanceMode">
+            <div class="panel">
+                <h2>Load Data</h2>
+                <div class="drop-zone" id="dropZone">
+                    <p>Drop S-parameter file here<br>or click to browse</p>
+                    <div class="formats">.s1p .s2p .csv</div>
+                    <input type="file" id="fileInput" accept=".s1p,.s2p,.csv,.txt">
+                </div>
+                <div class="demo-link">or <a href="#" id="loadDemo">load demo data</a> (patch antenna, 2.45 GHz)</div>
+                <div class="file-info" id="fileInfo"></div>
+                <div class="form-group" id="paramSelectGroup" style="display:none">
+                    <label>S-parameter</label>
+                    <select id="paramSelect">
+                        <option value="S11">S11</option>
+                        <option value="S22">S22</option>
+                        <option value="S21">S21</option>
+                        <option value="S12">S12</option>
+                    </select>
+                </div>
             </div>
-            <div class="demo-link">or <a href="#" id="loadDemo">load demo data</a> (patch antenna, 2.45 GHz)</div>
 
-            <div class="file-info" id="fileInfo"></div>
+            <div class="panel">
+                <h2>Matching Parameters</h2>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label>Band start</label>
+                        <input type="number" id="freqLeft" step="0.1" value="">
+                    </div>
+                    <div class="form-group">
+                        <label>Band stop</label>
+                        <input type="number" id="freqRight" step="0.1" value="">
+                    </div>
+                </div>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label>Filter order</label>
+                        <input type="number" id="order" min="2" max="12" value="6">
+                    </div>
+                    <div class="form-group">
+                        <label>Return loss (dB)</label>
+                        <input type="number" id="returnLoss" min="1" max="40" step="0.5" value="16">
+                    </div>
+                </div>
+                <div class="form-group">
+                    <label>Transmission zeros (optional)</label>
+                    <input type="text" id="tzInput" placeholder="e.g. 2.5, 3.0">
+                </div>
+                <button class="btn btn-primary" id="runBtn" disabled>Run Solver</button>
+                <div id="status">Loading WASM module...</div>
+            </div>
 
-            <div class="form-group" id="paramSelectGroup" style="display:none">
-                <label>S-parameter</label>
-                <select id="paramSelect">
-                    <option value="S11">S11</option>
-                    <option value="S22">S22</option>
-                    <option value="S21">S21</option>
-                    <option value="S12">S12</option>
-                </select>
+            <div class="panel" id="resultsPanel" style="display:none">
+                <h2>Results</h2>
+                <div id="resultBadge"></div>
+                <div id="resultDetails"></div>
             </div>
         </div>
 
-        <div class="panel">
-            <h2>Matching Parameters</h2>
-
-            <div class="form-row">
-                <div class="form-group">
-                    <label>Band start</label>
-                    <input type="number" id="freqLeft" step="0.1" value="">
+        <!-- Multiplexer synthesis mode -->
+        <div id="multiplexerMode" style="display:none">
+            <div class="panel">
+                <h2>Preset</h2>
+                <div class="preset-row">
+                    <button class="btn btn-preset" data-preset="duplexer">Duplexer<br><small>2×2% @ 1.9 GHz</small></button>
+                    <button class="btn btn-preset" data-preset="triplexer">Triplexer<br><small>3×10% @ 2.2 GHz</small></button>
                 </div>
-                <div class="form-group">
-                    <label>Band stop</label>
-                    <input type="number" id="freqRight" step="0.1" value="">
+                <div class="demo-link" style="margin-top:0.6rem">Choose a starting point, then tune below.</div>
+            </div>
+
+            <div class="panel">
+                <h2>Channels</h2>
+                <div id="channelList"></div>
+                <div class="channel-controls">
+                    <button class="btn-icon" id="addChannelBtn" title="Add channel">+ Add channel</button>
                 </div>
             </div>
 
-            <div class="form-row">
+            <div class="panel">
+                <h2>Manifold</h2>
                 <div class="form-group">
-                    <label>Filter order</label>
-                    <input type="number" id="order" min="2" max="12" value="6">
+                    <label>T-junction model</label>
+                    <select id="junctionModel">
+                        <option value="equal">Equal split (α = 0.5 per junction)</option>
+                        <option value="equal_power">Equal power per channel (α = 1/(N−j))</option>
+                        <option value="custom">Custom α per junction</option>
+                        <option value="s3p">Upload S-parameter file(s) (.s3p)</option>
+                    </select>
                 </div>
-                <div class="form-group">
-                    <label>Return loss (dB)</label>
-                    <input type="number" id="returnLoss" min="1" max="40" step="0.5" value="16">
+                <div id="junctionAlphaGroup" style="display:none"></div>
+                <div id="junctionFileGroup" style="display:none">
+                    <div class="drop-zone compact" id="junctionDropZone">
+                        <p>Drop .s3p file(s) for T-junctions<br>(one per junction, at center frequency)</p>
+                        <input type="file" id="junctionFileInput" accept=".s3p,.txt" multiple>
+                    </div>
+                    <div class="file-info" id="junctionFileInfo"></div>
                 </div>
             </div>
 
-            <div class="form-group">
-                <label>Transmission zeros (optional)</label>
-                <input type="text" id="tzInput" placeholder="e.g. 2.5, 3.0">
+            <div class="panel">
+                <h2>Synthesis</h2>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label>Center frequency</label>
+                        <input type="number" id="muxCenterFreq" step="0.1" value="1.96">
+                    </div>
+                    <div class="form-group">
+                        <label>Equiripple iters</label>
+                        <input type="number" id="muxEquiIters" min="0" max="50" value="10">
+                    </div>
+                </div>
+                <button class="btn btn-primary" id="muxRunBtn">Synthesize</button>
+                <div id="muxStatus">Loading WASM module...</div>
             </div>
 
-            <button class="btn btn-primary" id="runBtn" disabled>Run Solver</button>
-            <div id="status">Loading WASM module...</div>
-        </div>
-
-        <div class="panel" id="resultsPanel" style="display:none">
-            <h2>Results</h2>
-            <div id="resultBadge"></div>
-            <div id="resultDetails"></div>
+            <div class="panel" id="muxResultsPanel" style="display:none">
+                <h2>Results</h2>
+                <div id="muxResultSummary"></div>
+            </div>
         </div>
     </div>
 
     <!-- Right panel: plot + coupling matrix -->
     <div class="main-area">
         <div class="panel plot-panel">
-            <h2>Frequency Response</h2>
+            <h2 id="plotTitle">Frequency Response</h2>
             <div class="plot-area" id="plot"></div>
         </div>
 
         <div class="panel" id="cmPanel" style="display:none">
-            <h2>Coupling Matrix</h2>
+            <h2 id="cmTitle">Coupling Matrix</h2>
+            <div id="cmChannelTabs" class="cm-tab-row" style="display:none"></div>
             <div class="cm-table" id="couplingMatrix"></div>
         </div>
     </div>
 </div>
 
 <footer>
-    <p>npick &mdash; open-source impedance matching solver &middot; <a href="https://github.com/jedrzejmichalczyk/npick">GitHub</a> &middot; MIT License</p>
+    <p>npick &mdash; open-source Nevanlinna-Pick solver &middot; <a href="https://github.com/jedrzejmichalczyk/npick">GitHub</a> &middot; MIT License</p>
 </footer>
 
 <script type="application/ld+json">
@@ -123,7 +185,7 @@
   "@context": "https://schema.org",
   "@type": "SoftwareApplication",
   "name": "npick",
-  "description": "Broadband impedance matching network solver using Nevanlinna-Pick interpolation. Upload Touchstone S-parameter files and compute optimal coupling matrices.",
+  "description": "Nevanlinna-Pick solver for broadband impedance matching and manifold-coupled multiplexer synthesis. Browser-based, powered by WebAssembly.",
   "applicationCategory": "EngineeringApplication",
   "operatingSystem": "Web Browser",
   "url": "https://jedrzejmichalczyk.github.io/npick/",

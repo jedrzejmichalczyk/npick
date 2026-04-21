@@ -2,6 +2,7 @@ import { parseFile } from './touchstone.js';
 
 let Module = null;
 let solver = null;
+let muxSolver = null;
 let loadData = null;
 
 // Default S1P data: patch antenna with resonance at 2.45 GHz
@@ -76,12 +77,14 @@ async function initWasm() {
     try {
         Module = await createNpickModule();
         solver = new Module.SolverWrapper();
+        muxSolver = new Module.MultiplexerWrapper();
         statusEl.className = '';
-        // Push already-loaded default data to the solver
+        if (muxStatusEl) muxStatusEl.textContent = '';
         if (loadData && loadData.freqs.length >= 3) {
             solver.set_load_data(loadData.freqs, loadData.re, loadData.im);
         }
         updateRunButton();
+        refreshMuxRunBtn();
     } catch (e) {
         statusEl.textContent = 'Failed to load WASM module: ' + e.message;
         statusEl.className = 'error';
@@ -459,3 +462,507 @@ freqRightEl.addEventListener('change', plotLoad);
 
 // Load default data immediately so the plot is visible on page load
 loadDefaultData();
+
+// ============================================================================
+// Multiplexer synthesis mode
+// ============================================================================
+
+const CHANNEL_COLORS = ['#E53935', '#43A047', '#1E88E5', '#F57C00', '#8E24AA', '#00ACC1'];
+
+// DOM
+const impedanceModeEl = document.getElementById('impedanceMode');
+const multiplexerModeEl = document.getElementById('multiplexerMode');
+const modeTabs = document.querySelectorAll('.mode-tab');
+const channelListEl = document.getElementById('channelList');
+const addChannelBtn = document.getElementById('addChannelBtn');
+const junctionModelEl = document.getElementById('junctionModel');
+const junctionAlphaGroupEl = document.getElementById('junctionAlphaGroup');
+const junctionFileGroupEl = document.getElementById('junctionFileGroup');
+const junctionDropZone = document.getElementById('junctionDropZone');
+const junctionFileInput = document.getElementById('junctionFileInput');
+const junctionFileInfoEl = document.getElementById('junctionFileInfo');
+const muxCenterFreqEl = document.getElementById('muxCenterFreq');
+const muxEquiItersEl = document.getElementById('muxEquiIters');
+const muxRunBtn = document.getElementById('muxRunBtn');
+const muxStatusEl = document.getElementById('muxStatus');
+const muxResultsPanel = document.getElementById('muxResultsPanel');
+const muxResultSummary = document.getElementById('muxResultSummary');
+const cmChannelTabsEl = document.getElementById('cmChannelTabs');
+const plotTitleEl = document.getElementById('plotTitle');
+const cmTitleEl = document.getElementById('cmTitle');
+
+// Current multiplexer state
+let muxChannels = [];              // [{order, fl, fr, rl, tz (string)}, ...]
+let muxJunctionSMatrices = {};     // {junction_index: {re: [9], im: [9]}} — populated from .s3p uploads
+let muxResult = null;              // {cms: [...], rls: [...], resp: {freq, g11_db[], s21_db[]}}
+let activeCmChannel = 0;
+
+// ---- Mode switching ----
+modeTabs.forEach(tab => {
+    tab.addEventListener('click', () => {
+        modeTabs.forEach(t => t.classList.remove('active'));
+        tab.classList.add('active');
+        const mode = tab.dataset.mode;
+        if (mode === 'impedance') {
+            impedanceModeEl.style.display = '';
+            multiplexerModeEl.style.display = 'none';
+            plotTitleEl.textContent = 'Frequency Response';
+            if (loadData) plotLoad();
+            // Restore single-channel coupling matrix if available
+            if (solver && solver.get_cm_size && solver.get_cm_size() > 0) {
+                document.getElementById('cmPanel').style.display = '';
+                cmChannelTabsEl.style.display = 'none';
+                displayCouplingMatrix();
+            } else {
+                document.getElementById('cmPanel').style.display = 'none';
+            }
+        } else {
+            impedanceModeEl.style.display = 'none';
+            multiplexerModeEl.style.display = '';
+            plotTitleEl.textContent = 'Multiplexer Response';
+            if (muxResult) {
+                plotMultiplexerResponse(muxResult);
+                document.getElementById('cmPanel').style.display = '';
+                cmChannelTabsEl.style.display = '';
+                displayMuxCouplingMatrix(activeCmChannel);
+            } else {
+                document.getElementById('cmPanel').style.display = 'none';
+                // Draw empty plot
+                Plotly.newPlot('plot', [], {
+                    xaxis: { title: 'Frequency (GHz)' },
+                    yaxis: { title: 'dB' },
+                    margin: { t: 10, r: 20 }
+                }, { responsive: true });
+            }
+        }
+    });
+});
+
+// ---- Channel list management ----
+function renderChannelList() {
+    let html = '<div class="channel-row header">' +
+        '<div>#</div><div>Order</div><div>F<sub>left</sub> (GHz)</div>' +
+        '<div>F<sub>right</sub> (GHz)</div><div>RL (dB)</div><div></div></div>';
+    muxChannels.forEach((ch, i) => {
+        html += `<div class="channel-row" data-ch="${i}">
+            <div class="ch-label">${i + 1}</div>
+            <div class="form-group"><input type="number" class="ch-order" min="2" max="12" step="1" value="${ch.order}"></div>
+            <div class="form-group"><input type="number" class="ch-fl" step="0.01" value="${ch.fl}"></div>
+            <div class="form-group"><input type="number" class="ch-fr" step="0.01" value="${ch.fr}"></div>
+            <div class="form-group"><input type="number" class="ch-rl" step="0.5" value="${ch.rl}"></div>
+            <button class="ch-remove" title="Remove">×</button>
+        </div>`;
+    });
+    channelListEl.innerHTML = html;
+
+    // Bind events
+    channelListEl.querySelectorAll('.channel-row[data-ch]').forEach(row => {
+        const idx = parseInt(row.dataset.ch);
+        row.querySelector('.ch-order').addEventListener('change', e => {
+            muxChannels[idx].order = Math.max(2, Math.min(12, parseInt(e.target.value) || 4));
+        });
+        row.querySelector('.ch-fl').addEventListener('change', e => {
+            muxChannels[idx].fl = parseFloat(e.target.value);
+        });
+        row.querySelector('.ch-fr').addEventListener('change', e => {
+            muxChannels[idx].fr = parseFloat(e.target.value);
+        });
+        row.querySelector('.ch-rl').addEventListener('change', e => {
+            muxChannels[idx].rl = parseFloat(e.target.value);
+        });
+        row.querySelector('.ch-remove').addEventListener('click', () => {
+            if (muxChannels.length > 2) {
+                muxChannels.splice(idx, 1);
+                renderChannelList();
+                renderJunctionAlphaInputs();
+            } else {
+                muxStatusEl.textContent = 'Minimum 2 channels required.';
+                muxStatusEl.className = 'error';
+            }
+        });
+    });
+}
+
+addChannelBtn.addEventListener('click', () => {
+    if (muxChannels.length >= 6) {
+        muxStatusEl.textContent = 'Maximum 6 channels supported in the demo.';
+        muxStatusEl.className = 'error';
+        return;
+    }
+    // Default new channel: follow pattern from previous channel
+    const last = muxChannels[muxChannels.length - 1];
+    const bw = last ? (last.fr - last.fl) : 0.04;
+    const guard = 0.02;
+    const newFl = last ? last.fr + guard : 2.0;
+    muxChannels.push({
+        order: last ? last.order : 4,
+        fl: +newFl.toFixed(3),
+        fr: +(newFl + bw).toFixed(3),
+        rl: last ? last.rl : 23
+    });
+    renderChannelList();
+    renderJunctionAlphaInputs();
+});
+
+// ---- Junction model controls ----
+function renderJunctionAlphaInputs() {
+    const model = junctionModelEl.value;
+    junctionFileGroupEl.style.display = model === 's3p' ? '' : 'none';
+    if (model !== 'custom') {
+        junctionAlphaGroupEl.style.display = 'none';
+        junctionAlphaGroupEl.innerHTML = '';
+        return;
+    }
+    const N = muxChannels.length;
+    let html = '';
+    for (let j = 0; j < N - 1; j++) {
+        const existing = junctionAlphaGroupEl.querySelector(`.alpha-row[data-j="${j}"] input`);
+        const v = existing ? existing.value : (1.0 / (N - j)).toFixed(3);
+        html += `<div class="alpha-row" data-j="${j}">
+            <label>T<sub>${j + 1}</sub> α</label>
+            <input type="number" min="0.01" max="0.99" step="0.01" value="${v}">
+        </div>`;
+    }
+    junctionAlphaGroupEl.innerHTML = html;
+    junctionAlphaGroupEl.style.display = '';
+}
+
+junctionModelEl.addEventListener('change', renderJunctionAlphaInputs);
+
+// ---- Junction S-parameter file upload ----
+junctionDropZone.addEventListener('click', () => junctionFileInput.click());
+junctionFileInput.addEventListener('change', (e) => handleJunctionFiles(e.target.files));
+junctionDropZone.addEventListener('dragover', (e) => {
+    e.preventDefault();
+    junctionDropZone.classList.add('dragover');
+});
+junctionDropZone.addEventListener('dragleave', () => junctionDropZone.classList.remove('dragover'));
+junctionDropZone.addEventListener('drop', (e) => {
+    e.preventDefault();
+    junctionDropZone.classList.remove('dragover');
+    handleJunctionFiles(e.dataTransfer.files);
+});
+
+function handleJunctionFiles(files) {
+    muxJunctionSMatrices = {};
+    if (!files || files.length === 0) return;
+    const N = muxChannels.length;
+    let loaded = 0;
+    let infoParts = [];
+    Array.from(files).forEach((file, k) => {
+        if (k >= N - 1) return;
+        const reader = new FileReader();
+        reader.onload = (e) => {
+            const parsed = parseS3P(e.target.result);
+            if (parsed) {
+                // Evaluate at center frequency (use first row as simple default)
+                const fc = parseFloat(muxCenterFreqEl.value);
+                const S = interpolateS3P(parsed, fc);
+                muxJunctionSMatrices[k] = S;
+                infoParts[k] = `T${k + 1}: ${file.name}`;
+                loaded++;
+                if (loaded === Math.min(files.length, N - 1)) {
+                    junctionFileInfoEl.textContent = infoParts.filter(x => x).join(', ');
+                    junctionFileInfoEl.classList.add('visible');
+                }
+            }
+        };
+        reader.readAsText(file);
+    });
+}
+
+// Minimal .s3p parser (Touchstone 3-port, magnitude/phase or real/imag).
+function parseS3P(text) {
+    const lines = text.split('\n');
+    let fmt = 'MA', unit = 'GHz', z0 = 50;
+    const rows = [];
+    for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed || trimmed.startsWith('!')) continue;
+        if (trimmed.startsWith('#')) {
+            const parts = trimmed.substring(1).trim().split(/\s+/);
+            for (let i = 0; i < parts.length; i++) {
+                const p = parts[i].toUpperCase();
+                if (['HZ', 'KHZ', 'MHZ', 'GHZ'].includes(p)) unit = p;
+                else if (['MA', 'DB', 'RI'].includes(p)) fmt = p;
+                else if (p === 'R' && i + 1 < parts.length) z0 = parseFloat(parts[i + 1]);
+            }
+            continue;
+        }
+        const tokens = trimmed.split(/\s+/).map(parseFloat).filter(v => isFinite(v));
+        if (tokens.length >= 1 + 2 * 9) {
+            rows.push(tokens);
+        }
+    }
+    if (rows.length === 0) return null;
+    const scale = { HZ: 1e-9, KHZ: 1e-6, MHZ: 1e-3, GHZ: 1 }[unit] || 1;
+    return { rows, fmt, scale };
+}
+
+function interpolateS3P(parsed, freqGhz) {
+    const { rows, fmt, scale } = parsed;
+    // Find nearest freq row
+    let nearest = rows[0], minDist = Infinity;
+    for (const r of rows) {
+        const fGHz = r[0] * scale;
+        const d = Math.abs(fGHz - freqGhz);
+        if (d < minDist) { minDist = d; nearest = r; }
+    }
+    // Row format: freq, then 9 complex pairs (S11 S12 S13 S21 S22 S23 S31 S32 S33) in MA/DB/RI
+    const re = [], im = [];
+    for (let i = 0; i < 9; i++) {
+        const a = nearest[1 + 2 * i];
+        const b = nearest[2 + 2 * i];
+        let cr, ci;
+        if (fmt === 'RI') { cr = a; ci = b; }
+        else if (fmt === 'DB') {
+            const mag = Math.pow(10, a / 20);
+            const ph = b * Math.PI / 180;
+            cr = mag * Math.cos(ph); ci = mag * Math.sin(ph);
+        } else { // MA
+            const ph = b * Math.PI / 180;
+            cr = a * Math.cos(ph); ci = a * Math.sin(ph);
+        }
+        re.push(cr); im.push(ci);
+    }
+    return { re, im };
+}
+
+// ---- Presets ----
+document.querySelectorAll('[data-preset]').forEach(btn => {
+    btn.addEventListener('click', () => loadPreset(btn.dataset.preset));
+});
+
+function loadPreset(name) {
+    muxJunctionSMatrices = {};
+    junctionFileInfoEl.textContent = '';
+    junctionFileInfoEl.classList.remove('visible');
+
+    if (name === 'duplexer') {
+        muxChannels = [
+            { order: 4, fl: 1.88, fr: 1.92, rl: 23 },
+            { order: 4, fl: 2.00, fr: 2.04, rl: 23 }
+        ];
+        muxCenterFreqEl.value = 1.96;
+    } else if (name === 'triplexer') {
+        muxChannels = [
+            { order: 4, fl: 1.8, fr: 2.0, rl: 23 },
+            { order: 4, fl: 2.1, fr: 2.3, rl: 23 },
+            { order: 4, fl: 2.4, fr: 2.6, rl: 23 }
+        ];
+        muxCenterFreqEl.value = 2.2;
+    }
+    junctionModelEl.value = 'equal';
+    renderChannelList();
+    renderJunctionAlphaInputs();
+    muxStatusEl.textContent = `${name[0].toUpperCase()}${name.slice(1)} preset loaded. Click Synthesize.`;
+    muxStatusEl.className = '';
+}
+
+// Load duplexer preset on first open
+loadPreset('duplexer');
+
+// ---- Run multiplexer solver ----
+function refreshMuxRunBtn() {
+    muxRunBtn.disabled = !muxSolver || muxChannels.length < 2;
+}
+
+muxRunBtn.addEventListener('click', runMuxSolver);
+
+function runMuxSolver() {
+    if (!muxSolver) return;
+    refreshMuxRunBtn();
+    // Validate channels
+    for (let i = 0; i < muxChannels.length; i++) {
+        const c = muxChannels[i];
+        if (!isFinite(c.fl) || !isFinite(c.fr) || c.fl >= c.fr) {
+            muxStatusEl.textContent = `Channel ${i + 1}: invalid frequency band.`;
+            muxStatusEl.className = 'error';
+            return;
+        }
+        if (c.order < 2 || c.order > 12) {
+            muxStatusEl.textContent = `Channel ${i + 1}: order must be 2-12.`;
+            muxStatusEl.className = 'error';
+            return;
+        }
+    }
+
+    muxRunBtn.disabled = true;
+    muxStatusEl.textContent = 'Synthesizing multiplexer…';
+    muxStatusEl.className = 'running';
+
+    setTimeout(() => {
+        try {
+            muxSolver.reset_channels();
+            for (const c of muxChannels) {
+                muxSolver.add_channel(c.order, c.fl, c.fr, c.rl, [], []);
+            }
+            muxSolver.set_center_frequency(parseFloat(muxCenterFreqEl.value));
+            muxSolver.set_equiripple_iters(parseInt(muxEquiItersEl.value) || 0);
+
+            const N = muxChannels.length;
+            const model = junctionModelEl.value;
+            for (let j = 0; j < N - 1; j++) {
+                let alpha = 0.5;
+                if (model === 'equal_power') alpha = 1.0 / (N - j);
+                else if (model === 'custom') {
+                    const row = junctionAlphaGroupEl.querySelector(`.alpha-row[data-j="${j}"] input`);
+                    alpha = row ? parseFloat(row.value) : 0.5;
+                }
+                muxSolver.set_junction_alpha(j, alpha);
+
+                if (model === 's3p' && muxJunctionSMatrices[j]) {
+                    muxSolver.set_junction_s(j, muxJunctionSMatrices[j].re, muxJunctionSMatrices[j].im);
+                }
+            }
+
+            const t0 = performance.now();
+            const ok = muxSolver.solve();
+            const dt = performance.now() - t0;
+
+            if (!ok) {
+                muxResultsPanel.style.display = 'none';
+                document.getElementById('cmPanel').style.display = 'none';
+                muxStatusEl.textContent = 'Solver failed: ' + muxSolver.get_error_message();
+                muxStatusEl.className = 'error';
+                muxResult = null;
+                return;
+            }
+
+            const rls = [];
+            for (let i = 0; i < N; i++) rls.push(muxSolver.get_achieved_rl_db(i));
+
+            // Evaluate response over a generous sweep around the channels.
+            let fMin = Infinity, fMax = -Infinity;
+            for (const c of muxChannels) { fMin = Math.min(fMin, c.fl); fMax = Math.max(fMax, c.fr); }
+            const pad = 0.2 * (fMax - fMin);
+            const resp = muxSolver.evaluate_response(fMin - pad, fMax + pad, 1001);
+            const respJs = {
+                freq: jsArray(resp.freq),
+                g11_db: [],
+                s21_db: []
+            };
+            for (let i = 0; i < N; i++) {
+                respJs.g11_db.push(jsArray(resp.g11_db[i]));
+                respJs.s21_db.push(jsArray(resp.s21_db[i]));
+            }
+
+            muxResult = { rls, resp: respJs };
+            plotMultiplexerResponse(muxResult);
+
+            // Summary
+            muxResultsPanel.style.display = '';
+            const badges = muxChannels.map((c, i) => {
+                const color = CHANNEL_COLORS[i % CHANNEL_COLORS.length];
+                return `<span class="ch-badge"><span class="ch-color" style="background:${color}"></span>Ch ${i + 1}: ${rls[i].toFixed(1)} dB</span>`;
+            }).join('');
+            muxResultSummary.innerHTML =
+                `<div><b>Synthesis complete</b> in ${(dt / 1000).toFixed(1)}s.</div>` +
+                `<div class="channel-summary">${badges}</div>`;
+
+            // Coupling matrix tabs
+            document.getElementById('cmPanel').style.display = '';
+            cmChannelTabsEl.style.display = '';
+            activeCmChannel = 0;
+            renderCmTabs();
+            displayMuxCouplingMatrix(0);
+
+            muxStatusEl.textContent = `Done in ${(dt / 1000).toFixed(1)}s.`;
+            muxStatusEl.className = '';
+        } catch (e) {
+            muxStatusEl.textContent = 'Error: ' + (e.message || e);
+            muxStatusEl.className = 'error';
+        } finally {
+            muxRunBtn.disabled = false;
+        }
+    }, 30);
+}
+
+function plotMultiplexerResponse(res) {
+    const traces = [];
+    const N = res.rls.length;
+    for (let i = 0; i < N; i++) {
+        const color = CHANNEL_COLORS[i % CHANNEL_COLORS.length];
+        traces.push({
+            x: res.resp.freq,
+            y: res.resp.g11_db[i],
+            mode: 'lines',
+            name: `|G<sub>11</sub>| Ch ${i + 1}`,
+            legendgroup: `ch${i}`,
+            line: { color, width: 2 }
+        });
+        traces.push({
+            x: res.resp.freq,
+            y: res.resp.s21_db[i],
+            mode: 'lines',
+            name: `|S<sub>21</sub>| Ch ${i + 1}`,
+            legendgroup: `ch${i}`,
+            line: { color, width: 1, dash: 'dash' }
+        });
+    }
+    const shapes = muxChannels.map((c, i) => ({
+        type: 'rect', xref: 'x', yref: 'paper',
+        x0: c.fl, x1: c.fr, y0: 0, y1: 1,
+        fillcolor: hexToRgba(CHANNEL_COLORS[i % CHANNEL_COLORS.length], 0.08),
+        line: { width: 0 }
+    }));
+    Plotly.newPlot('plot', traces, {
+        xaxis: { title: 'Frequency (GHz)' },
+        yaxis: { title: 'dB', range: [-50, 2] },
+        margin: { t: 10, r: 20 },
+        shapes,
+        legend: { orientation: 'h', y: -0.15, yanchor: 'top' }
+    }, { responsive: true });
+}
+
+function hexToRgba(hex, a) {
+    const v = parseInt(hex.slice(1), 16);
+    return `rgba(${(v >> 16) & 0xff}, ${(v >> 8) & 0xff}, ${v & 0xff}, ${a})`;
+}
+
+function renderCmTabs() {
+    const N = muxChannels.length;
+    let html = '';
+    for (let i = 0; i < N; i++) {
+        html += `<button class="cm-tab ${i === activeCmChannel ? 'active' : ''}" data-ch="${i}">Ch ${i + 1}</button>`;
+    }
+    cmChannelTabsEl.innerHTML = html;
+    cmChannelTabsEl.querySelectorAll('.cm-tab').forEach(btn => {
+        btn.addEventListener('click', () => {
+            activeCmChannel = parseInt(btn.dataset.ch);
+            renderCmTabs();
+            displayMuxCouplingMatrix(activeCmChannel);
+        });
+    });
+}
+
+function displayMuxCouplingMatrix(ch) {
+    const n = muxSolver.get_cm_size(ch);
+    cmTitleEl.textContent = `Coupling Matrix — Channel ${ch + 1}`;
+    if (n === 0) { cmDiv.innerHTML = '<em>Empty.</em>'; return; }
+
+    const labels = ['S'];
+    for (let i = 1; i <= n - 2; i++) labels.push(String(i));
+    labels.push('L');
+
+    let html = '<table><tr><th></th>';
+    for (const lbl of labels) html += `<th>${lbl}</th>`;
+    html += '</tr>';
+    for (let i = 0; i < n; i++) {
+        html += `<tr><td class="row-header">${labels[i]}</td>`;
+        for (let j = 0; j < n; j++) {
+            const re = muxSolver.get_cm_real(ch, i, j);
+            const im = muxSolver.get_cm_imag(ch, i, j);
+            const mag = Math.sqrt(re * re + im * im);
+            let cls = i === j ? 'diagonal' : (mag < 1e-10 ? 'zero' : 'coupling');
+            let text;
+            if (mag < 1e-10) text = '0';
+            else if (Math.abs(im) < 1e-10) text = fmtNum(re);
+            else text = fmtNum(re) + (im >= 0 ? '+' : '') + fmtNum(im) + 'j';
+            html += `<td class="${cls}">${text}</td>`;
+        }
+        html += '</tr>';
+    }
+    html += '</table>';
+    cmDiv.innerHTML = html;
+}
