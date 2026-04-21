@@ -70,6 +70,14 @@ private:
      */
     std::vector<double> find_channel_peaks(int ch, const std::vector<double>& interp_freqs) const;
 
+    /**
+     * Like find_channel_peaks but also returns the frequency of each peak.
+     * peaks_mag and peaks_freq have size order+1.
+     */
+    void find_channel_peaks_xy(int ch, const std::vector<double>& interp_freqs,
+                               std::vector<double>& peaks_mag,
+                               std::vector<double>& peaks_freq) const;
+
     std::vector<ChannelSpec> specs_;
     Manifold manifold_;
     std::vector<MatrixXcd> cms_;

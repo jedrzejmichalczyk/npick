@@ -241,6 +241,16 @@ Complex MultiplexerMatching::eval_channel_response(int channel_idx, double freq)
 std::vector<double> MultiplexerMatching::find_channel_peaks(
     int ch, const std::vector<double>& ifreqs) const
 {
+    std::vector<double> mag, freq;
+    find_channel_peaks_xy(ch, ifreqs, mag, freq);
+    return mag;
+}
+
+void MultiplexerMatching::find_channel_peaks_xy(
+    int ch, const std::vector<double>& ifreqs,
+    std::vector<double>& peaks_mag,
+    std::vector<double>& peaks_freq) const
+{
     double fl = specs_[ch].freq_left;
     double fr = specs_[ch].freq_right;
     int n = static_cast<int>(ifreqs.size());
@@ -250,13 +260,15 @@ std::vector<double> MultiplexerMatching::find_channel_peaks(
     for (double f : ifreqs) boundaries.push_back(f);
     boundaries.push_back(fr);
 
-    std::vector<double> peaks(n + 1, 0.0);
+    peaks_mag.assign(n + 1, 0.0);
+    peaks_freq.assign(n + 1, 0.0);
 
     for (int seg = 0; seg <= n; ++seg) {
         double left = boundaries[seg];
         double right = boundaries[seg + 1];
         if (right - left < 1e-12) {
-            peaks[seg] = std::abs(eval_channel_response(ch, left));
+            peaks_mag[seg] = std::abs(eval_channel_response(ch, left));
+            peaks_freq[seg] = left;
             continue;
         }
 
@@ -283,9 +295,9 @@ std::vector<double> MultiplexerMatching::find_channel_peaks(
             b = std::min(right, best_freq + step);
         }
 
-        peaks[seg] = best_mag;
+        peaks_mag[seg] = best_mag;
+        peaks_freq[seg] = best_freq;
     }
-    return peaks;
 }
 
 bool MultiplexerMatching::solve_coupled(
@@ -349,9 +361,11 @@ void MultiplexerMatching::run_equiripple(
     std::vector<std::vector<double>>& interp_freqs)
 {
     // Per-channel sequential equiripple: cycle through channels, optimize one
-    // at a time using Newton on that channel's peak-difference residual.
-    // Each sub-problem has n_i variables (channel i's frequencies) and n_i
-    // peak-difference equations. Full coupled re-solve after each Newton step.
+    // at a time using Newton on that channel's peak-difference residual
+    //   F[k] = peak[k] - peak[k+1]  for k = 0..n-1
+    // (n equations, n unknowns = this channel's n interp freqs).
+    // Line search insists on REDUCING the channel's worst peak — never accept
+    // a step that makes it worse (common bug: unconditional last-resort accept).
 
     int N = static_cast<int>(specs_.size());
     auto best_cms = cms_;
@@ -359,16 +373,19 @@ void MultiplexerMatching::run_equiripple(
     auto best_freqs = interp_freqs;
     double best_worst_rl = *std::min_element(achieved_rls_.begin(), achieved_rls_.end());
 
-    if (verbose) {
-        for (int ch = 0; ch < N; ++ch) {
-            auto peaks = find_channel_peaks(ch, interp_freqs[ch]);
-            double mx = *std::max_element(peaks.begin(), peaks.end());
-            double mn = *std::min_element(peaks.begin(), peaks.end());
-            std::cout << "    Ch" << (ch+1) << ": worst=" << std::fixed
-                      << std::setprecision(1) << to_db(mx) << " dB, spread="
-                      << (to_db(mx) - to_db(mn)) << " dB\n";
+    auto update_rls = [&]() {
+        for (int i = 0; i < N; ++i) {
+            double worst = 0;
+            double fli = specs_[i].freq_left;
+            double fri = specs_[i].freq_right;
+            for (int k = 0; k < 201; ++k) {
+                double freq = fli + (fri - fli) * k / 200.0;
+                double mag = std::abs(eval_channel_response(i, freq));
+                if (std::isfinite(mag) && mag > worst) worst = mag;
+            }
+            achieved_rls_[i] = to_db(worst);
         }
-    }
+    };
 
     for (int outer = 0; outer < equiripple_outer_iterations; ++outer) {
         bool any_improved = false;
@@ -380,7 +397,6 @@ void MultiplexerMatching::run_equiripple(
             double bw = fr - fl;
             double fd_delta = 1e-5 * bw;
 
-            // Compute channel ch peak-difference residual: F[k] = peak[k] - peak[k+1]
             auto peaks = find_channel_peaks(ch, interp_freqs[ch]);
             double ch_max = *std::max_element(peaks.begin(), peaks.end());
             double ch_min = *std::min_element(peaks.begin(), peaks.end());
@@ -391,7 +407,6 @@ void MultiplexerMatching::run_equiripple(
             for (int k = 0; k < n; ++k)
                 F(k) = peaks[k] - peaks[k + 1];
 
-            // FD Jacobian: perturb each of this channel's n frequencies
             Eigen::MatrixXd J(n, n);
             bool jac_ok = true;
             for (int j = 0; j < n && jac_ok; ++j) {
@@ -412,13 +427,10 @@ void MultiplexerMatching::run_equiripple(
 
             if (!jac_ok) continue;
 
-            // Restore state
             if (!solve_coupled(interp_freqs)) break;
 
-            // Newton step
             Eigen::VectorXd dx = J.colPivHouseholderQr().solve(-F);
 
-            // Clamp
             double max_step = 0.25 * bw;
             double scale = 1.0;
             for (int k = 0; k < n; ++k)
@@ -426,10 +438,9 @@ void MultiplexerMatching::run_equiripple(
                     scale = std::min(scale, max_step / std::abs(dx(k)));
             dx *= scale;
 
-            // Line search: try to reduce this channel's worst peak
             double alpha = 1.0;
             bool accepted = false;
-            for (int ls = 0; ls < 8; ++ls) {
+            for (int ls = 0; ls < 10; ++ls) {
                 auto freqs_new = interp_freqs;
                 for (int k = 0; k < n; ++k)
                     freqs_new[ch][k] = std::clamp(
@@ -441,21 +452,9 @@ void MultiplexerMatching::run_equiripple(
                     auto peaks_new = find_channel_peaks(ch, freqs_new[ch]);
                     double new_max = *std::max_element(peaks_new.begin(), peaks_new.end());
 
-                    if (new_max < ch_max || ls == 7) {
+                    if (new_max < ch_max) {
                         interp_freqs = freqs_new;
-
-                        // Update achieved RL
-                        for (int i = 0; i < N; ++i) {
-                            double worst = 0;
-                            double fli = specs_[i].freq_left;
-                            double fri = specs_[i].freq_right;
-                            for (int k = 0; k < 201; ++k) {
-                                double freq = fli + (fri - fli) * k / 200.0;
-                                double mag = std::abs(eval_channel_response(i, freq));
-                                if (std::isfinite(mag) && mag > worst) worst = mag;
-                            }
-                            achieved_rls_[i] = to_db(worst);
-                        }
+                        update_rls();
 
                         double worst_rl = *std::min_element(
                             achieved_rls_.begin(), achieved_rls_.end());
@@ -465,7 +464,6 @@ void MultiplexerMatching::run_equiripple(
                             best_rls = achieved_rls_;
                             best_freqs = interp_freqs;
                         }
-
                         accepted = true;
                         any_improved = true;
                         break;
@@ -474,10 +472,7 @@ void MultiplexerMatching::run_equiripple(
                 alpha *= 0.5;
             }
 
-            if (!accepted) {
-                // Restore
-                solve_coupled(interp_freqs);
-            }
+            if (!accepted) solve_coupled(interp_freqs);
 
             if (verbose) {
                 std::cout << "    Outer " << outer << " Ch" << (ch+1) << ":";
