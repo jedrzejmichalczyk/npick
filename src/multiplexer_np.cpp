@@ -535,7 +535,12 @@ VectorXcd MultiplexerNevanlinnaPick::compute_residual(
                 Li = J_ii + lambda * coupling;
             }
 
-            F(ch.eq_offset + m) = fi - Li;
+            // Martinez §III.B matching condition: f_i(ξ) = conj(L_i(ξ)).
+            // Derivation: for a lossless reciprocal filter in Belevitch form
+            // with f = S22 = p/q and load reflection Γ_L, the input reflection
+            // G = ε·(p* − q*·Γ_L)/(q − p·Γ_L) vanishes iff Γ_L = p*/q* = conj(f)
+            // on the jω axis. So the load satisfies L = conj(f), i.e. f = conj(L).
+            F(ch.eq_offset + m) = fi - std::conj(Li);
         }
     }
     return F;
@@ -618,13 +623,21 @@ void MultiplexerNevanlinnaPick::compute_jacobians_wirtinger(
 
                 Complex left  = STv(j_in_Fi);
                 Complex right = WSF_Iv(j_in_Fi);
-                Complex scale = -lambda * left * right;
+                // F = f - conj(L):
+                //   ∂F/∂p      = ∂f/∂p      − conj(∂L/∂conj(p))
+                //   ∂F/∂conj(p)= ∂f/∂conj(p)− conj(∂L/∂p)
+                // Off-diagonal ∂L/∂p      = (λ·left·right)·df
+                //             ∂L/∂conj(p) = (λ·left·right)·df_conj
+                // so the off-diagonal entries swap (A ↔ B with conj).
+                Complex scale_conj = -lambda * std::conj(left * right);
 
                 for (int v = 0; v < ch_j.num_vars; ++v) {
                     Complex df      = polys[j].eval_df(v, s_j);
                     Complex df_conj = polys[j].eval_df_dconj(v, s_j);
-                    Jac_A(ch_i.eq_offset + m, ch_j.var_offset + v) = scale * df;
-                    Jac_B(ch_i.eq_offset + m, ch_j.var_offset + v) = scale * df_conj;
+                    Jac_A(ch_i.eq_offset + m, ch_j.var_offset + v) =
+                        scale_conj * std::conj(df_conj);
+                    Jac_B(ch_i.eq_offset + m, ch_j.var_offset + v) =
+                        scale_conj * std::conj(df);
                 }
             }
         }
@@ -706,7 +719,8 @@ VectorXcd MultiplexerNevanlinnaPick::compute_dF_dlambda(
             MatrixXcd I_dim = MatrixXcd::Identity(dim, dim);
             Complex coupling = (vi.transpose() * (I_dim - Fi_mat * wi).inverse()
                                 * Fi_mat * vi)(0, 0);
-            dFdl(ch.eq_offset + m) = -coupling;
+            // F = f − conj(L), conj(L) = conj(J_ii) + λ·conj(coupling) (λ real)
+            dFdl(ch.eq_offset + m) = -std::conj(coupling);
         }
     }
     return dFdl;
@@ -990,7 +1004,8 @@ bool MultiplexerNevanlinnaPick::shift_frequencies(
                 Complex L_minus = eval_coupled_load(i, phys_f - delta, 1.0, all_p);
                 Complex dL_dxi = (L_plus - L_minus) / (2.0 * delta);
 
-                dFdl(ch.eq_offset + m) = (df_dxi - dL_dxi) * dxi;
+                // F = f − conj(L)  ⇒  dF/dξ = df/dξ − conj(dL/dξ)
+                dFdl(ch.eq_offset + m) = (df_dxi - std::conj(dL_dxi)) * dxi;
             }
         }
 
