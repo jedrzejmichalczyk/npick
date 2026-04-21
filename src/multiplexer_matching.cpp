@@ -381,18 +381,57 @@ bool MultiplexerMatching::solve_coupled(
 void MultiplexerMatching::run_equiripple(
     std::vector<std::vector<double>>& interp_freqs)
 {
-    // Per-channel sequential equiripple: cycle through channels, optimize one
-    // at a time using Newton on that channel's peak-difference residual
-    //   F[k] = peak[k] - peak[k+1]  for k = 0..n-1
-    // (n equations, n unknowns = this channel's n interp freqs).
-    // Line search insists on REDUCING the channel's worst peak — never accept
-    // a step that makes it worse (common bug: unconditional last-resort accept).
+    // Joint (all-channels-at-once) Newton on peak-difference residuals.
+    //
+    // Unknowns: concatenated interp_freqs, size M = sum_i n_i.
+    // Residuals: for each channel, n_i adjacent peak-differences, size M.
+    //   F_{i,k} = peak_{i,k} - peak_{i,k+1}
+    // Jacobian: full M×M via forward FD on each interp frequency.
+    //
+    // Acceptance: worst-case peak magnitude ACROSS ALL CHANNELS must
+    // strictly decrease. This is the minimax criterion — a per-channel
+    // pass-over accepts each channel greedily and stalls on inter-channel
+    // trade-offs; the joint step picks a direction that accounts for those.
 
     int N = static_cast<int>(specs_.size());
-    auto best_cms = cms_;
-    auto best_rls = achieved_rls_;
-    auto best_freqs = interp_freqs;
-    double best_worst_rl = *std::min_element(achieved_rls_.begin(), achieved_rls_.end());
+
+    // Flatten/unflatten helpers and M computation.
+    std::vector<int> offsets(N + 1, 0);
+    for (int i = 0; i < N; ++i)
+        offsets[i + 1] = offsets[i] + static_cast<int>(interp_freqs[i].size());
+    int M = offsets[N];
+
+    auto flatten = [&](const std::vector<std::vector<double>>& f) {
+        Eigen::VectorXd x(M);
+        for (int i = 0; i < N; ++i)
+            for (int k = 0; k < static_cast<int>(f[i].size()); ++k)
+                x(offsets[i] + k) = f[i][k];
+        return x;
+    };
+    auto unflatten = [&](const Eigen::VectorXd& x) {
+        std::vector<std::vector<double>> f(N);
+        for (int i = 0; i < N; ++i) {
+            int n = offsets[i + 1] - offsets[i];
+            f[i].assign(n, 0.0);
+            for (int k = 0; k < n; ++k) f[i][k] = x(offsets[i] + k);
+            std::sort(f[i].begin(), f[i].end());
+        }
+        return f;
+    };
+
+    auto peaks_residual = [&](const std::vector<std::vector<double>>& f,
+                               Eigen::VectorXd& F, double& worst_peak) {
+        F.resize(M);
+        worst_peak = 0;
+        for (int i = 0; i < N; ++i) {
+            int n = static_cast<int>(f[i].size());
+            auto peaks = find_channel_peaks(i, f[i]);
+            for (int k = 0; k < n; ++k)
+                F(offsets[i] + k) = peaks[k] - peaks[k + 1];
+            for (double p : peaks)
+                if (std::isfinite(p) && p > worst_peak) worst_peak = p;
+        }
+    };
 
     auto update_rls = [&]() {
         for (int i = 0; i < N; ++i) {
@@ -408,108 +447,134 @@ void MultiplexerMatching::run_equiripple(
         }
     };
 
+    auto best_cms = cms_;
+    auto best_rls = achieved_rls_;
+    auto best_freqs = interp_freqs;
+    double best_worst_rl = *std::min_element(achieved_rls_.begin(), achieved_rls_.end());
+
+    Eigen::VectorXd F0;
+    double cur_worst = 0;
+    peaks_residual(interp_freqs, F0, cur_worst);
+
     for (int outer = 0; outer < equiripple_outer_iterations; ++outer) {
-        bool any_improved = false;
+        // Build full Jacobian by forward FD.
+        // Each column = 1 full coupled resolve + 1 peak scan.
+        Eigen::MatrixXd J(M, M);
+        bool jac_ok = true;
 
-        for (int ch = 0; ch < N; ++ch) {
-            int n = static_cast<int>(interp_freqs[ch].size());
-            double fl = specs_[ch].freq_left;
-            double fr = specs_[ch].freq_right;
-            double bw = fr - fl;
-            double fd_delta = 1e-5 * bw;
+        // Perturbation scale: small fraction of each band's bandwidth.
+        std::vector<double> fd_deltas(N);
+        for (int i = 0; i < N; ++i)
+            fd_deltas[i] = 1e-5 * (specs_[i].freq_right - specs_[i].freq_left);
 
-            auto peaks = find_channel_peaks(ch, interp_freqs[ch]);
-            double ch_max = *std::max_element(peaks.begin(), peaks.end());
-            double ch_min = *std::min_element(peaks.begin(), peaks.end());
+        for (int col = 0; col < M && jac_ok; ++col) {
+            int ch_col = 0;
+            while (ch_col + 1 < N && offsets[ch_col + 1] <= col) ++ch_col;
+            int k_col = col - offsets[ch_col];
 
-            if (ch_max - ch_min < 1e-4 * ch_max) continue;
+            auto freqs_pert = interp_freqs;
+            double delta = fd_deltas[ch_col];
+            freqs_pert[ch_col][k_col] += delta;
+            std::sort(freqs_pert[ch_col].begin(), freqs_pert[ch_col].end());
 
-            Eigen::VectorXd F(n);
-            for (int k = 0; k < n; ++k)
-                F(k) = peaks[k] - peaks[k + 1];
-
-            Eigen::MatrixXd J(n, n);
-            bool jac_ok = true;
-            for (int j = 0; j < n && jac_ok; ++j) {
-                auto freqs_pert = interp_freqs;
-                freqs_pert[ch][j] += fd_delta;
-
-                if (!solve_coupled(freqs_pert)) {
-                    freqs_pert = interp_freqs;
-                    freqs_pert[ch][j] -= fd_delta;
-                    fd_delta = -fd_delta;
-                    if (!solve_coupled(freqs_pert)) { jac_ok = false; break; }
-                }
-
-                auto peaks_p = find_channel_peaks(ch, freqs_pert[ch]);
-                for (int k = 0; k < n; ++k)
-                    J(k, j) = ((peaks_p[k] - peaks_p[k+1]) - F(k)) / fd_delta;
+            if (!solve_coupled(freqs_pert)) {
+                freqs_pert = interp_freqs;
+                delta = -delta;
+                freqs_pert[ch_col][k_col] += delta;
+                std::sort(freqs_pert[ch_col].begin(), freqs_pert[ch_col].end());
+                if (!solve_coupled(freqs_pert)) { jac_ok = false; break; }
             }
 
-            if (!jac_ok) continue;
+            Eigen::VectorXd F_pert;
+            double dummy;
+            peaks_residual(freqs_pert, F_pert, dummy);
 
-            if (!solve_coupled(interp_freqs)) break;
+            J.col(col) = (F_pert - F0) / delta;
+        }
 
-            Eigen::VectorXd dx = J.colPivHouseholderQr().solve(-F);
+        if (!jac_ok) {
+            if (verbose) std::cout << "    Joint Newton: Jacobian failed, stopping\n";
+            solve_coupled(interp_freqs);
+            break;
+        }
 
+        // Restore baseline state.
+        if (!solve_coupled(interp_freqs)) break;
+
+        // Newton step.
+        Eigen::VectorXd dx = J.colPivHouseholderQr().solve(-F0);
+
+        // Per-channel step clamp (prevent nodes from jumping out of band).
+        for (int i = 0; i < N; ++i) {
+            double bw = specs_[i].freq_right - specs_[i].freq_left;
             double max_step = 0.25 * bw;
-            double scale = 1.0;
-            for (int k = 0; k < n; ++k)
+            for (int k = offsets[i]; k < offsets[i + 1]; ++k) {
                 if (std::abs(dx(k)) > max_step)
-                    scale = std::min(scale, max_step / std::abs(dx(k)));
-            dx *= scale;
-
-            double alpha = 1.0;
-            bool accepted = false;
-            for (int ls = 0; ls < 10; ++ls) {
-                auto freqs_new = interp_freqs;
-                for (int k = 0; k < n; ++k)
-                    freqs_new[ch][k] = std::clamp(
-                        interp_freqs[ch][k] + alpha * dx(k),
-                        fl + bw * 0.02, fr - bw * 0.02);
-                std::sort(freqs_new[ch].begin(), freqs_new[ch].end());
-
-                if (solve_coupled(freqs_new)) {
-                    auto peaks_new = find_channel_peaks(ch, freqs_new[ch]);
-                    double new_max = *std::max_element(peaks_new.begin(), peaks_new.end());
-
-                    if (new_max < ch_max) {
-                        interp_freqs = freqs_new;
-                        update_rls();
-
-                        double worst_rl = *std::min_element(
-                            achieved_rls_.begin(), achieved_rls_.end());
-                        if (worst_rl < best_worst_rl) {
-                            best_worst_rl = worst_rl;
-                            best_cms = cms_;
-                            best_rls = achieved_rls_;
-                            best_freqs = interp_freqs;
-                        }
-                        accepted = true;
-                        any_improved = true;
-                        break;
-                    }
-                }
-                alpha *= 0.5;
-            }
-
-            if (!accepted) solve_coupled(interp_freqs);
-
-            if (verbose) {
-                std::cout << "    Outer " << outer << " Ch" << (ch+1) << ":";
-                for (int i = 0; i < N; ++i)
-                    std::cout << " " << std::fixed << std::setprecision(1)
-                              << achieved_rls_[i] << "dB";
-                if (accepted)
-                    std::cout << " a=" << std::setprecision(3) << alpha;
-                else
-                    std::cout << " (no improvement)";
-                std::cout << "\n";
+                    dx(k) *= max_step / std::abs(dx(k));
             }
         }
 
-        if (!any_improved) {
-            if (verbose) std::cout << "    No channel improved, stopping\n";
+        // Line search on WORST peak across all channels.
+        Eigen::VectorXd x_base = flatten(interp_freqs);
+        double alpha = 1.0;
+        bool accepted = false;
+        for (int ls = 0; ls < 10; ++ls) {
+            Eigen::VectorXd x_try = x_base + alpha * dx;
+
+            // Clamp each channel's nodes to its band.
+            for (int i = 0; i < N; ++i) {
+                double fl = specs_[i].freq_left;
+                double fr = specs_[i].freq_right;
+                double bw = fr - fl;
+                double lo = fl + 0.02 * bw;
+                double hi = fr - 0.02 * bw;
+                for (int k = offsets[i]; k < offsets[i + 1]; ++k)
+                    x_try(k) = std::clamp(x_try(k), lo, hi);
+            }
+
+            auto freqs_new = unflatten(x_try);
+
+            if (solve_coupled(freqs_new)) {
+                Eigen::VectorXd F_new;
+                double new_worst;
+                peaks_residual(freqs_new, F_new, new_worst);
+
+                if (new_worst < cur_worst) {
+                    interp_freqs = freqs_new;
+                    cur_worst = new_worst;
+                    F0 = F_new;
+                    update_rls();
+
+                    double worst_rl = *std::min_element(
+                        achieved_rls_.begin(), achieved_rls_.end());
+                    if (worst_rl < best_worst_rl) {
+                        best_worst_rl = worst_rl;
+                        best_cms = cms_;
+                        best_rls = achieved_rls_;
+                        best_freqs = interp_freqs;
+                    }
+                    accepted = true;
+                    break;
+                }
+            }
+            alpha *= 0.5;
+        }
+
+        if (verbose) {
+            std::cout << "    Joint " << outer << ":";
+            for (int i = 0; i < N; ++i)
+                std::cout << " " << std::fixed << std::setprecision(2)
+                          << achieved_rls_[i] << "dB";
+            if (accepted)
+                std::cout << " a=" << std::setprecision(3) << alpha
+                          << " worst=" << std::setprecision(2) << to_db(cur_worst) << "dB";
+            else
+                std::cout << " (no improvement, stopping)";
+            std::cout << "\n";
+        }
+
+        if (!accepted) {
+            solve_coupled(interp_freqs);
             break;
         }
     }
