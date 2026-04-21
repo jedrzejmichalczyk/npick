@@ -67,14 +67,14 @@ std::vector<MatrixXcd> MultiplexerMatching::run() {
             std::cout << "  Chebyshev residual at lambda=0: " << F0.norm() << "\n";
         }
 
-        // Newton iterations to solve F(x, 0) = 0
+        // Newton iterations to solve F(x, 0) = 0 using the real-variable
+        // Wirtinger step (F is not holomorphic in p; see multiplexer_np.cpp).
         for (int iter = 0; iter < 50; ++iter) {
             VectorXcd F = mux_np.compute_residual(x, 0.0);
             double res = F.norm();
             if (res < 1e-10) break;
 
-            MatrixXcd J = mux_np.compute_jacobian_dp(x, 0.0);
-            VectorXcd dx = J.colPivHouseholderQr().solve(-F);
+            VectorXcd dx = mux_np.newton_step(x, 0.0, F);
             x += dx;
 
             if (dx.norm() < 1e-12) break;
@@ -298,14 +298,13 @@ bool MultiplexerMatching::solve_coupled(
 
         VectorXcd x = mux_np.get_start_solution();
 
-        // Newton to solve decoupled problem (lambda=0) with damping
+        // Newton (real-variable Wirtinger) to solve decoupled problem at λ=0.
         for (int iter = 0; iter < 100; ++iter) {
             VectorXcd F = mux_np.compute_residual(x, 0.0);
             double res0 = F.norm();
             if (res0 < 1e-8) break;
 
-            MatrixXcd J = mux_np.compute_jacobian_dp(x, 0.0);
-            VectorXcd dx = J.colPivHouseholderQr().solve(-F);
+            VectorXcd dx = mux_np.newton_step(x, 0.0, F);
 
             double alpha = 1.0;
             bool stepped = false;

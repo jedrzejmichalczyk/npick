@@ -61,9 +61,29 @@ public:
     VectorXcd compute_residual(const VectorXcd& x, double lambda) const;
 
     /**
-     * Compute Jacobian dF/dp at given (x, lambda).
+     * Compute Jacobian dF/dp at given (x, lambda) — the Wirtinger
+     * holomorphic part ∂F/∂p only. For full Newton on complex p use
+     * compute_jacobians_wirtinger() or newton_step().
      */
     MatrixXcd compute_jacobian_dp(const VectorXcd& x, double lambda) const;
+
+    /**
+     * Compute BOTH Wirtinger Jacobians of F w.r.t. p's complex coefficients:
+     *   Jac_A(k, v) = ∂F_k/∂p_v        (holomorphic)
+     *   Jac_B(k, v) = ∂F_k/∂conj(p_v)  (antiholomorphic)
+     * The spectral factor q depends on |p|² via Feldtkeller, so ∂F/∂conj(p)
+     * is generically nonzero — Newton in complex p must use BOTH pieces.
+     */
+    void compute_jacobians_wirtinger(const VectorXcd& x, double lambda,
+                                     MatrixXcd& Jac_A, MatrixXcd& Jac_B) const;
+
+    /**
+     * One real-variable Newton step: build the 2M x 2M real Jacobian from
+     * the Wirtinger pair (A, B), solve J_real · [Re(dx); Im(dx)] = -[Re(F); Im(F)],
+     * and return dx packed as a complex M-vector. Caller picks the step size.
+     */
+    VectorXcd newton_step(const VectorXcd& x, double lambda,
+                          const VectorXcd& F) const;
 
     /**
      * Compute dF/dlambda at given (x, lambda).

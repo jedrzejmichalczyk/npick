@@ -150,17 +150,17 @@ colors = ['#E53935', '#43A047', '#1E88E5']
 labels = ['Ch A (1.8-2.0)', 'Ch B (2.1-2.3)', 'Ch C (2.4-2.6)']
 bands = [(1.8, 2.0), (2.1, 2.3), (2.4, 2.6)]
 
-# Top: S11 (reflection) per channel
+# Top: matched reflection G11 per channel (through the manifold)
 for i, (col, lbl, band) in enumerate(zip(colors, labels, bands)):
     ch = chr(ord('A') + i)
-    ax1.plot(f, data[f'S11_{ch}_dB'], color=col, lw=1.5, label=f'|S11| {lbl}')
+    ax1.plot(f, data[f'G11_{ch}_dB'], color=col, lw=1.5, label=f'|G11| {lbl}')
     ax1.axvspan(band[0], band[1], alpha=0.08, color=col)
 
-ax1.set_ylabel('|S11| (dB)')
+ax1.set_ylabel('|G11| (dB)')
 ax1.set_ylim(-40, 2)
 ax1.legend(loc='lower right', fontsize=9)
 ax1.grid(True, alpha=0.3)
-ax1.set_title('Triplexer: Per-Channel Filter Response')
+ax1.set_title('Triplexer: Matched Reflection (through manifold) and Transmission')
 
 # Bottom: S21 (transmission) per channel
 for i, (col, lbl, band) in enumerate(zip(colors, labels, bands)):

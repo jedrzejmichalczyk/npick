@@ -21,20 +21,33 @@ Polynomial<Complex> desc_to_poly(const VectorXcd& desc) {
 }
 
 // Precomputed polynomial state for one channel.
-// Caches spectral factor q and optionally Bezout derivative polynomials dq/dp_v.
+// Caches spectral factor q and, when requested, BOTH Wirtinger derivatives
+// of q w.r.t. each free complex coefficient p_v:
+//   dq_polys[v]      = ∂q/∂p_v        (holomorphic)
+//   dq_conj_polys[v] = ∂q/∂conj(p_v)  (antiholomorphic)
+//
+// Why both are needed: the Feldtkeller identity q·q_para = p·p_para + r·r_para
+// has p_para on the RHS, whose coefficients are conj(p_k) up to sign. So q
+// depends on BOTH p and conj(p). Assuming ∂q/∂conj(p_v) = 0 is only correct
+// for real-coefficient p, and silently biases Newton when p drifts complex
+// along the homotopy (Feldtkeller residual stalls at ~1e-5, step halving
+// death-spirals near λ=1). Solving the coupled system below is the general
+// fix — no real/complex-q branch.
 struct ChannelPolyState {
     Polynomial<Complex> p_poly;
     Polynomial<Complex> q_poly;
 
-    // Bezout derivatives (only populated when with_derivatives=true)
-    std::vector<Polynomial<Complex>> dq_polys; // dq/dp_v for each free variable v
-    std::vector<int> dp_degrees;               // degree of dp monomial per variable
+    // Populated only when with_derivatives=true.
+    std::vector<Polynomial<Complex>> dq_polys;       // ∂q/∂p_v
+    std::vector<Polynomial<Complex>> dq_conj_polys;  // ∂q/∂conj(p_v)
+    std::vector<int> dp_degrees;                     // s-degree of the varied coefficient
 
     Complex eval_f(Complex s) const {
         Complex q_val = q_poly.evaluate(s);
         return (std::abs(q_val) > 1e-15) ? p_poly.evaluate(s) / q_val : Complex(0);
     }
 
+    // ∂f/∂p_v  where f = p/q:  (mon_v·q − p·dq) / q²
     Complex eval_df(int v, Complex s) const {
         Complex p_val = p_poly.evaluate(s);
         Complex q_val = q_poly.evaluate(s);
@@ -43,11 +56,35 @@ struct ChannelPolyState {
         Complex dq_val = dq_polys[v].evaluate(s);
         return (dp_val * q_val - p_val * dq_val) / (q_val * q_val);
     }
+
+    // ∂f/∂conj(p_v):  p doesn't depend on conj(p_v), so only −p·dq_conj / q².
+    Complex eval_df_dconj(int v, Complex s) const {
+        Complex p_val = p_poly.evaluate(s);
+        Complex q_val = q_poly.evaluate(s);
+        if (std::abs(q_val) < 1e-15) return Complex(0);
+        Complex dq_conj_val = dq_conj_polys[v].evaluate(s);
+        return -p_val * dq_conj_val / (q_val * q_val);
+    }
 };
 
-// Build ChannelPolyState: one feldtkeller call per channel + optional Bezout solve.
-// p_desc: full monic descending coefficients (including leading 1)
-// r_desc: transmission polynomial descending coefficients
+// Build ChannelPolyState: one Feldtkeller call per channel + one coupled
+// Bezout LU per channel (shared across the d free variables).
+//
+// Bezout derivation (holding conj(p) fixed in the Wirtinger sense):
+//   q·q_para = p·p_para + r·r_para
+//   ⇒  dq·q_para + q·(dq_conj)_para = mon_v · p_para           (*)
+// (∂p_para/∂p_v = 0 and ∂q_para/∂p_v has coefficients conj(∂q/∂conj(p_v)),
+//  i.e. (dq_conj)_para.)
+//
+// Let Z := (dq_conj)_para. Both dq and Z are polynomials of degree ≤ d−1
+// (since q's leading coefficient is gauge-fixed real and independent of
+// non-leading p_v). Equation (*) gives 2d complex coefficient equations in
+// 2d complex unknowns (dq_0..dq_{d−1}, Z_0..Z_{d−1}). The LHS matrix is
+// the Sylvester-like pencil of (q_para, q), nonsingular since q is Hurwitz
+// and q_para is anti-Hurwitz (disjoint roots). Factor once per channel,
+// re-use across all v.
+//
+// Recover ∂q/∂conj(p_v) from Z via  (dq_conj)_k = (−1)^k · conj(Z_k).
 ChannelPolyState build_poly_state(
     const VectorXcd& p_desc,
     const VectorXcd& r_desc,
@@ -61,117 +98,65 @@ ChannelPolyState build_poly_state(
 
     if (!with_derivatives) return st;
 
+    // p has d+1 coefficients (ascending); monic ⇒ leading fixed ⇒ d free.
     int N = static_cast<int>(p_desc.size());
+    int d = N - 1;
     st.dq_polys.resize(num_vars);
+    st.dq_conj_polys.resize(num_vars);
     st.dp_degrees.resize(num_vars);
 
     auto p_para = st.p_poly.para_conjugate();
     auto q_para = st.q_poly.para_conjugate();
-    int q_deg = st.q_poly.degree();
-    int lhs_max_deg = q_deg + (N - 1);
-    int num_eqs = lhs_max_deg + 1;
 
-    double max_imag_q = 0, max_real_q = 0;
-    for (const auto& c : st.q_poly.coefficients) {
-        max_imag_q = std::max(max_imag_q, std::abs(c.imag()));
-        max_real_q = std::max(max_real_q, std::abs(c.real()));
+    auto coef = [](const Polynomial<Complex>& poly, int j) -> Complex {
+        if (j < 0 || j >= static_cast<int>(poly.coefficients.size()))
+            return Complex(0);
+        return poly.coefficients[j];
+    };
+
+    // Size of the coupled system.
+    int num_eqs = 2 * d;
+    int num_unk = 2 * d;
+    MatrixXcd A = MatrixXcd::Zero(num_eqs, num_unk);
+
+    for (int k = 0; k < num_eqs; ++k) {
+        // Column i ∈ [0, d): dq_i contribution = (q_para)_{k−i}
+        for (int i = 0; i < d; ++i) {
+            A(k, i) = coef(q_para, k - i);
+        }
+        // Column d+i ∈ [d, 2d): Z_i contribution = q_{k−i}
+        for (int i = 0; i < d; ++i) {
+            A(k, d + i) = coef(st.q_poly, k - i);
+        }
     }
-    bool q_is_real = max_imag_q < 1e-10 * std::max(1.0, max_real_q);
 
-    if (q_is_real) {
-        Eigen::MatrixXd A = Eigen::MatrixXd::Zero(2 * num_eqs, N);
+    auto lu = A.partialPivLu();
+
+    for (int v = 0; v < num_vars; ++v) {
+        int coeff_idx = v + 1;     // descending-coefficient index of p_v
+        int deg = d - coeff_idx;   // s-degree of that coefficient
+        st.dp_degrees[v] = deg;
+
+        // RHS: mon_v · p_para has coefficient k = (p_para)_{k − deg_v}
+        VectorXcd b = VectorXcd::Zero(num_eqs);
         for (int k = 0; k < num_eqs; ++k) {
-            double sign_i = 1.0;
-            for (int i = 0; i < N; ++i) {
-                int j = k - i;
-                if (j >= 0 && j <= q_deg) {
-                    Complex q_para_c = q_para.coefficients[j];
-                    Complex q_c = st.q_poly.coefficients[j];
-                    Complex coeff = q_para_c + q_c * sign_i;
-                    A(2 * k, i) += coeff.real();
-                    A(2 * k + 1, i) += coeff.imag();
-                }
-                sign_i = -sign_i;
-            }
+            b(k) = coef(p_para, k - deg);
         }
-        auto qr = A.colPivHouseholderQr();
 
-        for (int v = 0; v < num_vars; ++v) {
-            int coeff_idx = v + 1;
-            int deg = N - 1 - coeff_idx;
-            st.dp_degrees[v] = deg;
+        VectorXcd sol = lu.solve(b);
 
-            std::vector<Complex> dp_c(deg + 1, Complex(0));
-            dp_c[deg] = Complex(1);
-            Polynomial<Complex> dp(dp_c);
-            auto rhs_poly = dp * p_para + st.p_poly * dp.para_conjugate();
+        // dq: coefficients 0..d−1 from sol[0..d−1]; leading (degree d) = 0.
+        std::vector<Complex> dq_c(d, Complex(0));
+        for (int i = 0; i < d; ++i) dq_c[i] = sol(i);
+        st.dq_polys[v] = Polynomial<Complex>(dq_c);
 
-            int rhs_deg = rhs_poly.degree();
-            Eigen::VectorXd b = Eigen::VectorXd::Zero(2 * num_eqs);
-            for (int k = 0; k < num_eqs; ++k) {
-                Complex rc = (k <= rhs_deg) ? rhs_poly.coefficients[k] : Complex(0);
-                b(2 * k) = rc.real();
-                b(2 * k + 1) = rc.imag();
-            }
-
-            Eigen::VectorXd sol = qr.solve(b);
-            std::vector<Complex> dq_c(N);
-            for (int i = 0; i < N; ++i)
-                dq_c[i] = Complex(sol(i), 0);
-            st.dq_polys[v] = Polynomial<Complex>(dq_c);
+        // Recover dq_conj via (dq_conj)_k = (−1)^k · conj(Z_k).
+        std::vector<Complex> dq_conj_c(d, Complex(0));
+        for (int i = 0; i < d; ++i) {
+            double sgn = (i % 2 == 0) ? 1.0 : -1.0;
+            dq_conj_c[i] = sgn * std::conj(sol(d + i));
         }
-    } else {
-        Eigen::MatrixXd A = Eigen::MatrixXd::Zero(2 * num_eqs, 2 * N);
-        for (int k = 0; k < num_eqs; ++k) {
-            double sign = 1.0;
-            for (int i = 0; i < N; ++i) {
-                int j_idx = k - i;
-                if (j_idx >= 0 && j_idx <= q_deg) {
-                    Complex qp_j = q_para.coefficients[j_idx];
-                    Complex q_j = st.q_poly.coefficients[j_idx];
-                    A(2*k,   2*i)   += qp_j.real() + sign * q_j.real();
-                    A(2*k,   2*i+1) += -qp_j.imag() + sign * q_j.imag();
-                    A(2*k+1, 2*i)   += qp_j.imag() + sign * q_j.imag();
-                    A(2*k+1, 2*i+1) += qp_j.real() - sign * q_j.real();
-                }
-                sign = -sign;
-            }
-        }
-        auto qr = A.colPivHouseholderQr();
-
-        for (int v = 0; v < num_vars; ++v) {
-            int coeff_idx = v + 1;
-            int deg = N - 1 - coeff_idx;
-            st.dp_degrees[v] = deg;
-
-            std::vector<Complex> dp_c(deg + 1, Complex(0));
-            dp_c[deg] = Complex(1);
-            Polynomial<Complex> dp(dp_c);
-            auto rhs_poly = dp * p_para + st.p_poly * dp.para_conjugate();
-
-            int rhs_deg = rhs_poly.degree();
-            Eigen::VectorXd b = Eigen::VectorXd::Zero(2 * num_eqs);
-            for (int k = 0; k < num_eqs; ++k) {
-                Complex rc = (k <= rhs_deg) ? rhs_poly.coefficients[k] : Complex(0);
-                b(2 * k) = rc.real();
-                b(2 * k + 1) = rc.imag();
-            }
-
-            Eigen::VectorXd sol = qr.solve(b);
-            std::vector<Complex> dq_c(N);
-            for (int i = 0; i < N; ++i)
-                dq_c[i] = Complex(sol(2*i), sol(2*i+1));
-
-            if (N > 0 && N <= static_cast<int>(st.q_poly.coefficients.size())) {
-                double denom = st.q_poly.coefficients[N - 1].real();
-                if (std::abs(denom) > 1e-15) {
-                    double beta = dq_c[N - 1].imag() / denom;
-                    for (int i = 0; i < N && i < static_cast<int>(st.q_poly.coefficients.size()); ++i)
-                        dq_c[i] -= Complex(0, 1) * beta * st.q_poly.coefficients[i];
-                }
-            }
-            st.dq_polys[v] = Polynomial<Complex>(dq_c);
-        }
+        st.dq_conj_polys[v] = Polynomial<Complex>(dq_conj_c);
     }
 
     return st;
@@ -556,115 +541,137 @@ VectorXcd MultiplexerNevanlinnaPick::compute_residual(
     return F;
 }
 
-MatrixXcd MultiplexerNevanlinnaPick::compute_jacobian_dp(
-    const VectorXcd& x, double lambda) const
+void MultiplexerNevanlinnaPick::compute_jacobians_wirtinger(
+    const VectorXcd& x, double lambda,
+    MatrixXcd& Jac_A, MatrixXcd& Jac_B) const
 {
     auto all_p = split_variables(x);
 
-    // Precompute polynomials and Bezout derivatives for all channels (N feldtkeller + N Bezout solves)
     std::vector<ChannelPolyState> polys(num_channels_);
     for (int k = 0; k < num_channels_; ++k)
         polys[k] = build_poly_state(all_p[k], channels_[k].r_coeffs,
                                      channels_[k].num_vars, true);
 
-    MatrixXcd Jac = MatrixXcd::Zero(total_eqs_, total_vars_);
+    Jac_A = MatrixXcd::Zero(total_eqs_, total_vars_);
+    Jac_B = MatrixXcd::Zero(total_eqs_, total_vars_);
 
-    // Diagonal blocks: df(p_i)/dp_i at channel i's own interpolation frequencies
+    // Diagonal blocks: ∂f_i/∂p_{i,v} and ∂f_i/∂conj(p_{i,v}) at channel i's
+    // interpolation frequencies.
     for (int i = 0; i < num_channels_; ++i) {
         auto& ch_i = channels_[i];
         for (int m = 0; m < ch_i.order; ++m) {
             Complex s(0, ch_i.norm_freqs[m]);
-            for (int v = 0; v < ch_i.num_vars; ++v)
-                Jac(ch_i.eq_offset + m, ch_i.var_offset + v) = polys[i].eval_df(v, s);
-        }
-    }
-
-    // Off-diagonal blocks: -lambda * conj(dL_i/dp_j)
-    if (std::abs(lambda) > 1e-15) {
-        for (int i = 0; i < num_channels_; ++i) {
-            auto& ch_i = channels_[i];
-
-            for (int m = 0; m < ch_i.order; ++m) {
-                double phys_freq = ch_i.interp_freqs[m];
-                auto J_mfold = manifold_->compute_J(phys_freq);
-                VectorXcd vi = manifold_->compute_Vi(J_mfold, i);
-                MatrixXcd wi = manifold_->compute_Wi(J_mfold, i);
-
-                int dim = num_channels_ - 1;
-                MatrixXcd Fi = MatrixXcd::Zero(dim, dim);
-
-                int col = 0;
-                for (int k = 0; k < num_channels_; ++k) {
-                    if (k == i) continue;
-                    double nf = (phys_freq - channels_[k].freq_center)
-                              / channels_[k].freq_scale;
-                    Fi(col, col) = polys[k].eval_f(Complex(0, nf));
-                    col++;
-                }
-
-                MatrixXcd I_dim = MatrixXcd::Identity(dim, dim);
-                MatrixXcd S = (I_dim - Fi * wi).inverse();
-                MatrixXcd WSF_I = wi * S * Fi + I_dim;
-
-                for (int j = 0; j < num_channels_; ++j) {
-                    if (j == i) continue;
-                    auto& ch_j = channels_[j];
-
-                    int j_in_Fi = 0;
-                    for (int kk = 0; kk < j; ++kk)
-                        if (kk != i) j_in_Fi++;
-
-                    double norm_freq_j = (phys_freq - ch_j.freq_center)
-                                       / ch_j.freq_scale;
-                    Complex s_j(0, norm_freq_j);
-
-                    // Precompute coupling vectors for rank-1 update
-                    // dL = (v^T S)_{j_in_Fi} * df * (WSF_I v)_{j_in_Fi}
-                    VectorXcd vTS = S.transpose() * vi;    // S^T v
-                    VectorXcd WSF_Iv = WSF_I * vi;
-
-                    Complex left  = vTS(j_in_Fi);           // (v^T S)_{j_in_Fi}
-                    Complex right = WSF_Iv(j_in_Fi);
-
-                    for (int v = 0; v < ch_j.num_vars; ++v) {
-                        Complex df_j_dpv = polys[j].eval_df(v, s_j);
-                        Complex dL = left * df_j_dpv * right;
-                        Jac(ch_i.eq_offset + m, ch_j.var_offset + v) =
-                            -lambda * dL;
-                    }
-                }
+            for (int v = 0; v < ch_i.num_vars; ++v) {
+                Jac_A(ch_i.eq_offset + m, ch_i.var_offset + v) = polys[i].eval_df(v, s);
+                Jac_B(ch_i.eq_offset + m, ch_i.var_offset + v) = polys[i].eval_df_dconj(v, s);
             }
         }
     }
 
-    // One-time FD Jacobian check
-    static bool checked = false;
-    if (!checked && std::abs(lambda) > 0.1) {
-        checked = true;
-        double eps = 1e-7;
-        MatrixXcd Jac_fd = MatrixXcd::Zero(total_eqs_, total_vars_);
-        VectorXcd F0 = compute_residual(x, lambda);
-        for (int j = 0; j < total_vars_; ++j) {
-            VectorXcd x_pert = x;
-            x_pert(j) += eps;
-            VectorXcd F1 = compute_residual(x_pert, lambda);
-            Jac_fd.col(j) = (F1 - F0) / eps;
-        }
-        double max_err = 0;
-        int worst_r = 0, worst_c = 0;
-        for (int r = 0; r < total_eqs_; ++r)
-            for (int c = 0; c < total_vars_; ++c) {
-                double err = std::abs(Jac(r,c) - Jac_fd(r,c));
-                if (err > max_err) { max_err = err; worst_r = r; worst_c = c; }
-            }
-        std::cout << "  JAC CHECK: max_err=" << max_err
-                  << " at (" << worst_r << "," << worst_c << ")"
-                  << " analytical=" << Jac(worst_r,worst_c)
-                  << " FD=" << Jac_fd(worst_r,worst_c)
-                  << " |Jac|=" << Jac.norm() << " |Jac_fd|=" << Jac_fd.norm() << "\n";
-    }
+    if (std::abs(lambda) < 1e-15) return;
 
-    return Jac;
+    // Off-diagonal blocks: ∂(−L_i)/∂(p_{j,v} | conj(p_{j,v})) for j ≠ i.
+    // Chain rule: L_i depends on p_j only through f_j = f_j(p_j, conj(p_j)),
+    // and the rank-1 structure of dL/df_j factors out:
+    //   ∂L_i/∂f_j = λ · (v_i^T · m)_{j_in_Fi} · ((W_i · m · F_i + I) · v_i)_{j_in_Fi}
+    // where m = (I − F_i · W_i)^{-1}. Both holomorphic and antiholomorphic
+    // Jacobians share this scaling; only ∂f_j/∂(…) differs.
+    for (int i = 0; i < num_channels_; ++i) {
+        auto& ch_i = channels_[i];
+
+        for (int m = 0; m < ch_i.order; ++m) {
+            double phys_freq = ch_i.interp_freqs[m];
+            auto J_mfold = manifold_->compute_J(phys_freq);
+            VectorXcd vi = manifold_->compute_Vi(J_mfold, i);
+            MatrixXcd wi = manifold_->compute_Wi(J_mfold, i);
+
+            int dim = num_channels_ - 1;
+            MatrixXcd Fi = MatrixXcd::Zero(dim, dim);
+
+            int col = 0;
+            for (int k = 0; k < num_channels_; ++k) {
+                if (k == i) continue;
+                double nf = (phys_freq - channels_[k].freq_center)
+                          / channels_[k].freq_scale;
+                Fi(col, col) = polys[k].eval_f(Complex(0, nf));
+                col++;
+            }
+
+            MatrixXcd I_dim = MatrixXcd::Identity(dim, dim);
+            MatrixXcd Sm = (I_dim - Fi * wi).inverse();
+            MatrixXcd WSF_I = wi * Sm * Fi + I_dim;
+
+            VectorXcd STv = Sm.transpose() * vi;
+            VectorXcd WSF_Iv = WSF_I * vi;
+
+            for (int j = 0; j < num_channels_; ++j) {
+                if (j == i) continue;
+                auto& ch_j = channels_[j];
+
+                int j_in_Fi = 0;
+                for (int kk = 0; kk < j; ++kk)
+                    if (kk != i) j_in_Fi++;
+
+                double norm_freq_j = (phys_freq - ch_j.freq_center)
+                                   / ch_j.freq_scale;
+                Complex s_j(0, norm_freq_j);
+
+                Complex left  = STv(j_in_Fi);
+                Complex right = WSF_Iv(j_in_Fi);
+                Complex scale = -lambda * left * right;
+
+                for (int v = 0; v < ch_j.num_vars; ++v) {
+                    Complex df      = polys[j].eval_df(v, s_j);
+                    Complex df_conj = polys[j].eval_df_dconj(v, s_j);
+                    Jac_A(ch_i.eq_offset + m, ch_j.var_offset + v) = scale * df;
+                    Jac_B(ch_i.eq_offset + m, ch_j.var_offset + v) = scale * df_conj;
+                }
+            }
+        }
+    }
+}
+
+MatrixXcd MultiplexerNevanlinnaPick::compute_jacobian_dp(
+    const VectorXcd& x, double lambda) const
+{
+    MatrixXcd A, B;
+    compute_jacobians_wirtinger(x, lambda, A, B);
+    return A;
+}
+
+VectorXcd MultiplexerNevanlinnaPick::newton_step(
+    const VectorXcd& x, double lambda, const VectorXcd& F) const
+{
+    // Real 2M × 2M Newton system derived from the Wirtinger pair (A, B):
+    //   ∂F/∂p · δp + ∂F/∂conj(p) · conj(δp) = −F
+    // Splitting δp = δp_r + i·δp_i and matching real/imag parts:
+    //   [ Re(A+B)   Im(B−A) ] [ δp_r ]   [ −Re(F) ]
+    //   [ Im(A+B)   Re(A−B) ] [ δp_i ] = [ −Im(F) ]
+    int M = total_vars_;
+    int E = total_eqs_;
+
+    MatrixXcd A, B;
+    compute_jacobians_wirtinger(x, lambda, A, B);
+
+    MatrixXd J_real(2 * E, 2 * M);
+    MatrixXcd ApB = A + B;
+    MatrixXcd AmB = A - B;
+    MatrixXcd BmA = B - A;
+    J_real.block(0, 0, E, M) = ApB.real();
+    J_real.block(0, M, E, M) = BmA.imag();
+    J_real.block(E, 0, E, M) = ApB.imag();
+    J_real.block(E, M, E, M) = AmB.real();
+
+    VectorXd F_real(2 * E);
+    F_real.head(E) = F.real();
+    F_real.tail(E) = F.imag();
+
+    VectorXd y = J_real.colPivHouseholderQr().solve(-F_real);
+
+    VectorXcd dx(M);
+    for (int i = 0; i < M; ++i)
+        dx(i) = Complex(y(i), y(M + i));
+    return dx;
 }
 
 VectorXcd MultiplexerNevanlinnaPick::compute_dF_dlambda(
@@ -711,54 +718,83 @@ bool MultiplexerNevanlinnaPick::run_continuation(
 {
     double lambda = 0.0;
     double h = lambda_step;
+    int M = total_vars_;
+    int E = total_eqs_;
 
     std::ofstream path_log("continuation_path.csv");
     path_log << "step,lambda,h,residual,newton_iters,dx_norm,x_norm,predictor_res,cond,tangent_norm";
-    for (int i = 0; i < total_vars_; ++i)
+    for (int i = 0; i < M; ++i)
         path_log << ",x" << i << "_re,x" << i << "_im";
     path_log << "\n";
 
+    // Helper: assemble the real 2E × 2M Jacobian from Wirtinger blocks.
+    auto make_real_jac = [&](const MatrixXcd& A, const MatrixXcd& B,
+                              MatrixXd& J_real) {
+        J_real.resize(2 * E, 2 * M);
+        MatrixXcd ApB = A + B;
+        MatrixXcd AmB = A - B;
+        MatrixXcd BmA = B - A;
+        J_real.block(0, 0, E, M) = ApB.real();
+        J_real.block(0, M, E, M) = BmA.imag();
+        J_real.block(E, 0, E, M) = ApB.imag();
+        J_real.block(E, M, E, M) = AmB.real();
+    };
+
+    auto pack_real_F = [&](const VectorXcd& F) {
+        VectorXd F_real(2 * E);
+        F_real.head(E) = F.real();
+        F_real.tail(E) = F.imag();
+        return F_real;
+    };
+    auto unpack_complex = [&](const VectorXd& y) {
+        VectorXcd out(M);
+        for (int i = 0; i < M; ++i) out(i) = Complex(y(i), y(M + i));
+        return out;
+    };
+
     // Log starting point at lambda=0
     {
-        auto write_x = [&](const VectorXcd& v) {
-            for (int i = 0; i < total_vars_; ++i)
-                path_log << "," << v(i).real() << "," << v(i).imag();
-        };
         path_log << -1 << "," << 0.0 << "," << 0 << ","
                  << compute_residual(x, 0.0).norm() << ","
                  << 0 << "," << 0 << "," << x.norm() << "," << 0
                  << "," << 0 << "," << 0;
-        write_x(x);
+        for (int i = 0; i < M; ++i)
+            path_log << "," << x(i).real() << "," << x(i).imag();
         path_log << "\n";
     }
 
     for (int step = 0; step < max_steps && lambda < 1.0 - 1e-12; ++step) {
         if (lambda + h > 1.0) h = 1.0 - lambda;
 
-        // Compute Jacobian and dF/dlambda at current point (once per step)
-        MatrixXcd Jp = compute_jacobian_dp(x, lambda);
+        // Wirtinger Jacobians and dF/dlambda at current point.
+        MatrixXcd A, B;
+        compute_jacobians_wirtinger(x, lambda, A, B);
         VectorXcd dFdl = compute_dF_dlambda(x, lambda);
 
-        // Condition number via SVD
-        Eigen::JacobiSVD<MatrixXcd> svd(Jp);
+        MatrixXd J_real;
+        make_real_jac(A, B, J_real);
+
+        Eigen::JacobiSVD<MatrixXd> svd(J_real);
         auto sv = svd.singularValues();
         double cond = (sv(sv.size()-1) > 1e-15) ? sv(0)/sv(sv.size()-1) : 1e15;
 
-        // Tangent: dx/dlambda = -J^{-1} * dF/dlambda (unit step)
-        auto Jp_qr = Jp.colPivHouseholderQr();
-        VectorXcd tangent = Jp_qr.solve(-dFdl);
+        // Tangent:  ∂F/∂p · τ + ∂F/∂conj(p) · conj(τ) = −dF/dλ
+        auto qr_tan = J_real.colPivHouseholderQr();
+        VectorXd tau_real = qr_tan.solve(-pack_real_F(dFdl));
+        VectorXcd tangent = unpack_complex(tau_real);
         double tangent_norm = tangent.norm();
 
         // Euler predictor
-        VectorXcd dx = tangent * h;
-        VectorXcd x_pred = x + dx;
+        VectorXcd x_pred = x + tangent * h;
         double new_lambda = lambda + h;
 
         double predictor_res = compute_residual(x_pred, new_lambda).norm();
 
-        // Full Newton corrector
+        // Wirtinger Newton corrector with plateau detection.
         bool converged = false;
         int newton_iters = 0;
+        double prev_res = std::numeric_limits<double>::infinity();
+        int plateau_count = 0;
         for (int iter = 0; iter < newton_max_iter; ++iter) {
             VectorXcd F = compute_residual(x_pred, new_lambda);
             double res = F.norm();
@@ -775,18 +811,40 @@ bool MultiplexerNevanlinnaPick::run_continuation(
                 break;
             }
 
-            MatrixXcd Jc = compute_jacobian_dp(x_pred, new_lambda);
-            VectorXcd correction = Jc.colPivHouseholderQr().solve(-F);
+            if (res > 0.95 * prev_res) plateau_count++;
+            else plateau_count = 0;
+            if (plateau_count >= 3 && res < 10.0 * newton_tol) {
+                if (verbose && step < 3) std::cout << " [plateau-accept]\n";
+                converged = true;
+                newton_iters = iter + 1;
+                break;
+            }
+            prev_res = res;
+
+            MatrixXcd Ac, Bc;
+            compute_jacobians_wirtinger(x_pred, new_lambda, Ac, Bc);
+            MatrixXd Jr_c;
+            make_real_jac(Ac, Bc, Jr_c);
+
+            VectorXd corr_real = Jr_c.colPivHouseholderQr().solve(-pack_real_F(F));
+            VectorXcd correction = unpack_complex(corr_real);
 
             double alpha = 1.0;
+            bool stepped = false;
             for (int ls = 0; ls < 10; ++ls) {
                 VectorXcd x_try = x_pred + alpha * correction;
                 double res_try = compute_residual(x_try, new_lambda).norm();
-                if (res_try < res) { x_pred = x_try; break; }
+                if (res_try < res) { x_pred = x_try; stepped = true; break; }
                 alpha *= 0.5;
             }
             if (verbose && step < 3) std::cout << "\n";
-            if (alpha < 1e-8) break;
+            if (!stepped || alpha < 1e-8) {
+                if (res < 10.0 * newton_tol) {
+                    converged = true;
+                    newton_iters = iter + 1;
+                }
+                break;
+            }
             newton_iters = iter + 1;
         }
 
@@ -812,17 +870,14 @@ bool MultiplexerNevanlinnaPick::run_continuation(
                           << " newton=" << newton_iters << "\n";
             }
 
-            // Adaptive step based on predictor quality
+            // Adaptive step based on predictor quality.
             double pred_ratio = predictor_res / newton_tol;
-            if (pred_ratio < 10.0)
-                h = std::min(h * 2.0, 1.0 - lambda);
-            else if (pred_ratio < 100.0)
-                h = std::min(h * 1.5, 1.0 - lambda);
-            else
-                h = std::min(h * 1.2, 1.0 - lambda);
+            double grow = (pred_ratio < 10.0)  ? 2.0 :
+                          (pred_ratio < 100.0) ? 1.5 : 1.2;
+            h = std::min(h * grow, 1.0 - lambda);
         } else {
             h *= 0.5;
-            if (h < 1e-12) {
+            if (h < 1e-10) {
                 if (verbose) {
                     VectorXcd F = compute_residual(x, lambda);
                     std::cout << "    Stalled at lambda=" << std::fixed << std::setprecision(6)
@@ -939,12 +994,12 @@ bool MultiplexerNevanlinnaPick::shift_frequencies(
             }
         }
 
-        MatrixXcd Jp = compute_jacobian_dp(x, 1.0);
-        VectorXcd dx = Jp.colPivHouseholderQr().solve(-dFdl * h);
+        // Wirtinger tangent: solve the real 2E × 2M system
+        //   A·τ + B·conj(τ) = −dFdl    (treating dFdl as the RHS of the tangent eqn)
+        VectorXcd dx_tangent_h = newton_step(x, 1.0, dFdl * h);
+        VectorXcd x_pred = x + dx_tangent_h;
 
-        VectorXcd x_pred = x + dx;
-
-        // Newton corrector at blended frequencies
+        // Newton corrector at blended frequencies (real-variable Wirtinger).
         set_blended(new_lambda);
         bool converged = false;
         for (int iter = 0; iter < newton_max; ++iter) {
@@ -952,8 +1007,7 @@ bool MultiplexerNevanlinnaPick::shift_frequencies(
             double res = F.norm();
             if (res < newton_tol) { converged = true; break; }
 
-            MatrixXcd Jp_new = compute_jacobian_dp(x_pred, 1.0);
-            VectorXcd corr = Jp_new.colPivHouseholderQr().solve(-F);
+            VectorXcd corr = newton_step(x_pred, 1.0, F);
 
             // Backtracking
             double alpha = 1.0;
