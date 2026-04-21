@@ -1,7 +1,14 @@
-# nevanlinna-pick-cpp
+# npick — Broadband Impedance Matching via Nevanlinna-Pick Interpolation
 
-C++17 library for broadband impedance matching network synthesis via
-Nevanlinna-Pick interpolation.
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![C++17](https://img.shields.io/badge/C%2B%2B-17-blue.svg)](https://en.cppreference.com/w/cpp/17)
+[![CMake 3.16+](https://img.shields.io/badge/CMake-3.16%2B-blue.svg)](https://cmake.org/)
+[![Try it online](https://img.shields.io/badge/demo-WebAssembly-orange.svg)](https://jedrzejmichalczyk.github.io/npick/)
+
+**npick** is a fast, header-friendly C++17 library for synthesizing broadband
+impedance matching networks using Nevanlinna-Pick interpolation. It is aimed at
+RF/microwave engineers and researchers who need automated matching network design
+from measured or simulated S-parameter data.
 
 Given a complex load reflection coefficient and a filter specification, the
 solver finds a matching network (output as a coupling matrix) that minimizes the
@@ -9,14 +16,15 @@ worst-case reflection across the passband. The algorithm is based on homotopy
 continuation from a Chebyshev prototype, followed by an equiripple Newton
 optimizer that drives all passband ripple peaks to equal height.
 
-## Features
+## Key Features
 
-- Equiripple Newton optimizer with backtracking line search
-- Homotopy continuation with adaptive Dormand-Prince 8(5,3) predictor-corrector
-- All-pole and cross-coupled filters with prescribed transmission zeros
-- Symmetric load detection and reduced parameterization
-- Direct coupling matrix output (transversal form), ready for physical realization
-- Single dependency: [Eigen](https://eigen.tuxfamily.org/) (header-only)
+- **Equiripple Newton optimizer** with backtracking line search
+- **Homotopy continuation** with adaptive Dormand-Prince 8(5,3) predictor-corrector
+- **All-pole and cross-coupled filters** with prescribed transmission zeros
+- **Symmetric load detection** and reduced parameterization
+- **Direct coupling matrix output** (transversal form), ready for physical realization
+- **Browser-based demo** — run the solver entirely client-side via [WebAssembly](https://jedrzejmichalczyk.github.io/npick/)
+- **Single dependency**: [Eigen](https://eigen.tuxfamily.org/) (header-only)
 
 ## Building
 
@@ -100,6 +108,13 @@ A browser-based interface is available in [`web/`](web/). Upload a Touchstone
 (`.s1p`, `.s2p`) or CSV file, select a passband, and run the solver entirely
 client-side via WebAssembly. See [`web/README.md`](web/README.md) for build
 instructions.
+
+## Keywords
+
+impedance matching, Nevanlinna-Pick interpolation, RF microwave filter design,
+coupling matrix synthesis, broadband matching, S-parameter, Touchstone,
+equiripple optimization, homotopy continuation, C++ scientific computing,
+WebAssembly
 
 ## License
 
