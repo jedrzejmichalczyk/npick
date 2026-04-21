@@ -72,6 +72,9 @@ target_link_libraries(benchmark_suite PRIVATE nevanlinna_pick)
 add_executable(triplexer_example examples/triplexer_example.cpp)
 target_link_libraries(triplexer_example PRIVATE nevanlinna_pick)
 
+add_executable(duplexer_example examples/duplexer_example.cpp)
+target_link_libraries(duplexer_example PRIVATE nevanlinna_pick)
+
 # Tests (optional)
 option(BUILD_TESTS "Build unit tests" ON)
 if(BUILD_TESTS)
