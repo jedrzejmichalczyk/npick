@@ -27,6 +27,27 @@ std::vector<MatrixXcd> MultiplexerMatching::run() {
         std::cout << "Multiplexer synthesis: " << N << " channels\n";
     }
 
+    // Step 0: T-junction split ratios.
+    // Two possible defaults exist:
+    //   (a) equal-split (alpha=0.5 on every junction, the TJunction default):
+    //       for a serial N-channel topology this sends fraction 1/2^k to each
+    //       channel, overweighting the near-common ones.
+    //   (b) equal-power-per-channel: alpha_j = 1/(N-j) so every channel gets
+    //       1/N of the input power.
+    // For a triplexer with uniform 10% bandwidths, empirically (a) yields
+    // better worst-case RL (-11 dB) than (b) (-10 dB) — the near-common
+    // channel benefits from less manifold phase distortion even though it
+    // carries more signal power. For non-uniform bandwidths (wider main
+    // channel, narrower side channels à la Martinez), (b) is typically
+    // better. Users can override the split ratios by calling manifold()
+    // and set_junction() after construction.
+    //
+    // (The short-circuit reflections P_1 = P_2 = -S_ab/(conj(S_ba)*det(S))
+    // equal -1 for any alpha since det(S)=1 for a lossless reciprocal
+    // T-junction, so the §II manifold-line-length scan is alpha-invariant.)
+    //
+    // Default: leave junctions at alpha=0.5 (set in Manifold constructor).
+
     // Step 1: Design manifold
     if (verbose) std::cout << "  Step 1: Computing manifold line lengths...\n";
     manifold_.compute_line_lengths(specs_);

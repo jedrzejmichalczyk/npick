@@ -35,6 +35,12 @@ public:
 
     const std::vector<MatrixXcd>& coupling_matrices() const { return cms_; }
     const Manifold& manifold() const { return manifold_; }
+
+    /**
+     * Non-const manifold access for overriding T-junction split ratios or
+     * fixing line lengths before run() is called.
+     */
+    Manifold& manifold() { return manifold_; }
     const std::vector<double>& achieved_return_losses_db() const { return achieved_rls_; }
 
     /**
