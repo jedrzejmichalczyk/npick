@@ -679,7 +679,16 @@ VectorXcd MultiplexerNevanlinnaPick::newton_step(
     F_real.head(E) = F.real();
     F_real.tail(E) = F.imag();
 
-    VectorXd y = J_real.colPivHouseholderQr().solve(-F_real);
+    // At the real-coefficient starting point (e.g. the Chebyshev prototype at
+    // lambda=0), the real 2E x 2M Jacobian has a non-trivial null space — the
+    // imaginary parts of the variables are unreachable by any residual
+    // direction. Native Eigen's colPivHouseholderQr returns a valid
+    // least-squares step through this rank deficiency; WASM / emscripten's
+    // rounding lands on a marginally worse pivot and produces a NaN step,
+    // which then propagates into NaN polynomial coefficients on the next
+    // iteration. completeOrthogonalDecomposition is the minimum-norm solver
+    // for rank-deficient systems and gives a stable step in both toolchains.
+    VectorXd y = J_real.completeOrthogonalDecomposition().solve(-F_real);
 
     VectorXcd dx(M);
     for (int i = 0; i < M; ++i)
@@ -793,8 +802,11 @@ bool MultiplexerNevanlinnaPick::run_continuation(
         double cond = (sv(sv.size()-1) > 1e-15) ? sv(0)/sv(sv.size()-1) : 1e15;
 
         // Tangent:  ∂F/∂p · τ + ∂F/∂conj(p) · conj(τ) = −dF/dλ
-        auto qr_tan = J_real.colPivHouseholderQr();
-        VectorXd tau_real = qr_tan.solve(-pack_real_F(dFdl));
+        // Use completeOrthogonalDecomposition — the real Jacobian is
+        // rank-deficient along imaginary-axis directions at the
+        // real-coefficient start, and colPivHouseholderQr produces NaN
+        // under WASM rounding (see newton_step comment).
+        VectorXd tau_real = J_real.completeOrthogonalDecomposition().solve(-pack_real_F(dFdl));
         VectorXcd tangent = unpack_complex(tau_real);
         double tangent_norm = tangent.norm();
 
@@ -840,7 +852,7 @@ bool MultiplexerNevanlinnaPick::run_continuation(
             MatrixXd Jr_c;
             make_real_jac(Ac, Bc, Jr_c);
 
-            VectorXd corr_real = Jr_c.colPivHouseholderQr().solve(-pack_real_F(F));
+            VectorXd corr_real = Jr_c.completeOrthogonalDecomposition().solve(-pack_real_F(F));
             VectorXcd correction = unpack_complex(corr_real);
 
             double alpha = 1.0;
