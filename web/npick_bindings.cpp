@@ -414,8 +414,13 @@ public:
         val js_freq = val::array();
 
         int N = static_cast<int>(cms_.size());
-        std::vector<val> js_g11(N, val::array());
-        std::vector<val> js_s21(N, val::array());
+        std::vector<val> js_g11, js_s21;
+        js_g11.reserve(N);
+        js_s21.reserve(N);
+        for (int i = 0; i < N; ++i) {
+            js_g11.push_back(val::array());
+            js_s21.push_back(val::array());
+        }
 
         if (!mux_) {
             result.set("freq", js_freq);
