@@ -58,10 +58,10 @@ void ChebyshevFilter::synthesize() {
     // Scale D by epsilon and leading coefficient
     auto D_scaled = D_lambda * (1.0 / (epsilon * std::abs(c)));
 
-    // Convert P to s-domain. D is real, lambda_to_s produces a para-Hermitian
-    // polynomial, and multiplying by -1 preserves that property. Any imaginary
-    // phase factor would break para-Hermitian symmetry and corrupt from_polynomials.
-    P_ = lambda_to_s(D_scaled) * Complex(-1, 0);
+    // Convert P to s-domain with proper phase
+    // P has phase factor i^(n%2 + 1)
+    Complex phase = std::pow(Complex(0, 1), (order_ % 2) + 1);
+    P_ = lambda_to_s(D_scaled) * phase;
 
     F_ = F_s;
 
