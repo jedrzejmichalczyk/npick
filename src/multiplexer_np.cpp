@@ -42,6 +42,17 @@ struct ChannelPolyState {
     std::vector<Polynomial<Complex>> dq_conj_polys;  // ∂q/∂conj(p_v)
     std::vector<int> dp_degrees;                     // s-degree of the varied coefficient
 
+    // Compute s^deg without std::pow, which returns NaN for (0, 0) under
+    // emscripten/WASM's libm even though native libm returns (1, 0). Odd
+    // filter orders put the middle Chebyshev node exactly at the band
+    // center (normalized freq = 0), so this corner case is always hit.
+    static Complex s_pow(Complex s, int deg) {
+        if (deg == 0) return Complex(1, 0);
+        Complex result = s;
+        for (int i = 1; i < deg; ++i) result *= s;
+        return result;
+    }
+
     Complex eval_f(Complex s) const {
         Complex q_val = q_poly.evaluate(s);
         return (std::abs(q_val) > 1e-15) ? p_poly.evaluate(s) / q_val : Complex(0);
@@ -52,7 +63,7 @@ struct ChannelPolyState {
         Complex p_val = p_poly.evaluate(s);
         Complex q_val = q_poly.evaluate(s);
         if (std::abs(q_val) < 1e-15) return Complex(0);
-        Complex dp_val = std::pow(s, dp_degrees[v]);
+        Complex dp_val = s_pow(s, dp_degrees[v]);
         Complex dq_val = dq_polys[v].evaluate(s);
         return (dp_val * q_val - p_val * dq_val) / (q_val * q_val);
     }
@@ -130,7 +141,14 @@ ChannelPolyState build_poly_state(
         }
     }
 
-    auto lu = A.partialPivLu();
+    // partialPivLu pivots on the largest entry in the current column; on
+    // near-singular complex matrices with specific sparsity patterns
+    // (arising at odd d with real-coefficient Hurwitz q) the pivot choice
+    // can produce NaN under WASM/emscripten rounding while native libm
+    // picks a different numerically-valid pivot. completeOrthogonalDecomposition
+    // is the rank-revealing solver and behaves identically on both
+    // toolchains. Factor once, re-use for all free variables.
+    auto cod = A.completeOrthogonalDecomposition();
 
     for (int v = 0; v < num_vars; ++v) {
         int coeff_idx = v + 1;     // descending-coefficient index of p_v
@@ -143,7 +161,7 @@ ChannelPolyState build_poly_state(
             b(k) = coef(p_para, k - deg);
         }
 
-        VectorXcd sol = lu.solve(b);
+        VectorXcd sol = cod.solve(b);
 
         // dq: coefficients 0..d−1 from sol[0..d−1]; leading (degree d) = 0.
         std::vector<Complex> dq_c(d, Complex(0));
